@@ -1,4 +1,3 @@
-from collections import defaultdict
 from pathlib import Path
 from typing import List
 
@@ -61,24 +60,27 @@ class AttendanceData(DataSource):
         ]
         sessions: List[str] = []
         for col in session_candidates:
-            # if the entire column is filled with "-", drop the column
-            # (indicates session not recorded)
-            # otherwise, replace any '-' with 'A' (Absent) and keep the column
-            if (df[col] == "-").all():
+            # If the entire column is unrecorded, drop it. Per-student "-"
+            # values remain unrecorded and are excluded from attendance counts.
+            normalized = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": "", "None": ""})
+            )
+            if normalized.replace("", "-").eq("-").all():
                 logger.info(f"Dropping unrecorded session column: {col}")
                 del df[col]
             else:
-                df[col] = df[col].replace("-", "A")
+                df[col] = normalized
                 sessions.append(col)
 
         # update the status count columns
-        def count_status(row: pd.Series, status: str) -> int:
-            return sum(1 for v in row if v == status)
-
         for status in cls.statuses:
-            df[status] = df[sessions].apply(
-                lambda row: count_status(row, status), axis=1
-            )
+            if sessions:
+                df[status] = df[sessions].eq(status).sum(axis=1).astype(int)
+            else:
+                df[status] = 0
 
         # update the score column
         # score = (P + 0.5*R)/(P+R+A) [ X are ignored ]
