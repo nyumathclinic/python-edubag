@@ -20,56 +20,181 @@ from .client import GradescopeClient
 app = typer.Typer(help="Gradescope management commands")
 
 
+def _load_scoresheet(input_path: Path) -> Scoresheet:
+    """Load a scoresheet from a zip or CSV file."""
+    if input_path.name.endswith("_Version_Set_Scores.zip"):
+        return VersionedScoresheet.from_zip(input_path)
+    elif input_path.name.endswith("_scores.csv"):
+        return Scoresheet.from_csv(input_path)
+    else:
+        raise ValueError("Input file must be a Gradescope scores zip or CSV file.")
+
+
+def _merge_scoresheets_to_gradebook(scoresheets: List[Scoresheet]) -> Gradebook:
+    """Merge multiple scoresheets into one Brightspace gradebook.
+
+    Creates one Brightspace grade item column per input scoresheet, joined by Username.
+    """
+    if not scoresheets:
+        raise ValueError("Must provide at least one scoresheet to merge")
+
+    merged = None
+    used_grade_columns: set[str] = set()
+
+    for scoresheet in scoresheets:
+        gb = Gradebook.from_gradescope_scoresheet(scoresheet)
+        frame = gb.grades.copy()
+        grade_columns = [col for col in frame.columns if col != "Username"]
+
+        if len(grade_columns) != 1:
+            raise ValueError("Expected exactly one grade column when converting scoresheet")
+
+        original_col = grade_columns[0]
+        unique_col = original_col
+        suffix = 2
+        while unique_col in used_grade_columns:
+            unique_col = f"{original_col} ({suffix})"
+            suffix += 1
+
+        if unique_col != original_col:
+            frame = frame.rename(columns={original_col: unique_col})
+
+        used_grade_columns.add(unique_col)
+        merged = frame if merged is None else merged.merge(frame, on="Username", how="outer")
+
+    merged_gb = Gradebook()
+    merged_gb.grades = merged  # type: ignore[assignment]
+    merged_gb.data = merged_gb.grades.copy()
+    merged_gb.metadata = {
+        "source": "gradescope_scoresheets",
+        "type": "brightspace_gradebook_merged_from_gradescope",
+        "items": len(used_grade_columns),
+    }
+    return merged_gb
+
+
 @app.command("gs2bs")
 def gradescope_scores_file_to_brightspace_gradebook_csv(
-    input: Annotated[
-        Path, typer.Argument(help="Path to the Gradescope scores zip or CSV file.")
+    inputs: Annotated[
+        List[Path],
+        typer.Argument(help="Path(s) to the Gradescope scores zip or CSV file(s)."),
     ],
     output: Annotated[
         Path | None,
-        typer.Argument(help="Path to the output Brightspace gradebook CSV file."),
+        typer.Option(help="Path to the output Brightspace gradebook CSV file or directory."),
     ] = None,
     by_section: Annotated[
         bool, typer.Option(help="Save separate files for each section.")
     ] = False,
+    merge: Annotated[
+        bool,
+        typer.Option(
+            "--merge/--separate",
+            help="Merge multiple inputs into one output or export each input separately.",
+        ),
+    ] = False,
 ):
-    """Convert a Gradescope scores file to a Brightspace gradebook CSV file.
+    """Convert Gradescope scores file(s) to Brightspace gradebook CSV file(s).
 
-    `input` can be either a zip file containing versioned assignment scores
+    Each `input` can be either a zip file containing versioned assignment scores
     or a CSV file for unversioned assignments.
 
-    If no `output` path is provided, the output file is created in the same
-    directory as the input file, with spaces in the filename replaced by
-    underscores and the suffix changed to `.csv`.
+    By default, each input file generates a separate output file (--separate mode).
+    Use --merge to combine multiple inputs into a single output with one grade
+    column per input.
+
+    If no `output` path is provided:
+    - In separate mode: output files are created in the same directory as each input
+    - In merge mode: the merged output is created in the same directory as the first input
 
     If `by_section` is True, separate gradebook files are created for each section.
 
     """
-    if input.name.endswith("_Version_Set_Scores.zip"):
-        scoresheet = VersionedScoresheet.from_zip(input)
-    elif input.name.endswith("_scores.csv"):
-        scoresheet = Scoresheet.from_csv(input)
+    # Load all scoresheets
+    scoresheets = [_load_scoresheet(input_path) for input_path in inputs]
+    
+    if merge:
+        # Merge mode: combine all inputs into one output
+        merged_name = " + ".join([ss.name for ss in scoresheets])
+
+        # Determine output path
+        if output is None:
+            output_path = inputs[0].with_name(merged_name.replace(" ", "_")).with_suffix(".csv")
+        elif output.is_dir() or (not output.exists() and str(output).endswith("/")):
+            # If output looks like a directory, create a filename within it
+            output_path = output / Path(merged_name.replace(" ", "_")).with_suffix(".csv")
+        else:
+            output_path = output
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if by_section:
+            # Merge each section independently so each section file includes all items.
+            sectioned_inputs = [
+                SectionedScoresheet(name=ss.name, scores=ss.scores).by_section()
+                for ss in scoresheets
+            ]
+            all_sections = sorted({section for d in sectioned_inputs for section in d.keys()})
+
+            for section in all_sections:
+                section_scoresheets = [d[section] for d in sectioned_inputs if section in d]
+                section_gradebook = _merge_scoresheets_to_gradebook(section_scoresheets)
+                section_output = output_path.with_stem(f"{output_path.stem}_section_{section}")
+                logger.info(
+                    f"Writing merged Brightspace gradebook for section {section} to {section_output}"
+                )
+                section_gradebook.to_csv(section_output)
+        else:
+            merged_gradebook = _merge_scoresheets_to_gradebook(scoresheets)
+            logger.info(f"Merged {len(scoresheets)} scoresheets into one Brightspace gradebook")
+            merged_gradebook.to_csv(output_path)
+
+        logger.success(f"Conversion complete. Output saved to {output_path.parent}")
+    
     else:
-        raise ValueError("Input file must be a Gradescope scores zip or CSV file.")
-    if output is None:
-        output = input.with_name(scoresheet.name.replace(" ", "_")).with_suffix(".csv")
-    output.parent.mkdir(parents=True, exist_ok=True)
+        # Separate mode: each input generates its own output
+        for i, (input_path, scoresheet) in enumerate(zip(inputs, scoresheets)):
+            # Determine output path for this input
+            if output is None:
+                output_path = input_path.with_name(scoresheet.name.replace(" ", "_")).with_suffix(".csv")
+            elif output.is_dir() or (not output.exists() and str(output).endswith("/")):
+                # If output looks like a directory, create a filename within it
+                output_path = output / Path(scoresheet.name.replace(" ", "_")).with_suffix(".csv")
+            else:
+                # If output is a file path, use it for the first input
+                # For subsequent inputs, append a suffix
+                if i == 0:
+                    output_path = output
+                else:
+                    output_path = output.with_stem(f"{output.stem}_{i}")
+            
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_gradebook(scoresheet, output_path, by_section)
+            logger.success(f"Conversion complete for {input_path.name}. Output saved to {output_path}")
+
+
+def _write_gradebook(scoresheet: Scoresheet, output_path: Path, by_section: bool) -> None:
+    """Write a scoresheet as a Brightspace gradebook CSV.
+    
+    Args:
+        scoresheet: The scoresheet to convert
+        output_path: Path to the output CSV file
+        by_section: Whether to split by section
+    """
     if by_section:
         # Use SectionedScoresheet to split by section (handles NaN students gracefully)
         sectioned = SectionedScoresheet(name=scoresheet.name, scores=scoresheet.scores)
         sections_dict = sectioned.by_section()
         for section, section_scoresheet in sections_dict.items():
             gradebook = Gradebook.from_gradescope_scoresheet(section_scoresheet)
-            section_output = output.with_stem(f"{output.stem}_section_{section}")
+            section_output = output_path.with_stem(f"{output_path.stem}_section_{section}")
             logger.info(
                 f"Writing Brightspace gradebook for section {section} to {section_output}"
             )
             gradebook.to_csv(section_output)
     else:
         gradebook = Gradebook.from_gradescope_scoresheet(scoresheet)
-        logger.debug(f"Writing Brightspace gradebook to {output}")
-        gradebook.to_csv(output)
-    return
+        logger.debug(f"Writing Brightspace gradebook to {output_path}")
+        gradebook.to_csv(output_path)
 
 
 @app.command("bs2gs")
