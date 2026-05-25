@@ -1,10 +1,13 @@
 """Module to automate interactions with the Gradescope platform."""
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import platformdirs
 from dotenv import load_dotenv
@@ -13,6 +16,10 @@ from playwright.sync_api import Page, sync_playwright
 
 from edubag.albert.term import Term
 from edubag.clients import LMSClient
+
+if TYPE_CHECKING:
+    from edubag.gradescope.assignment import Assignment
+    from edubag.gradescope.course import Course
 
 
 class GradescopeClient(LMSClient):
@@ -274,7 +281,7 @@ class GradescopeClient(LMSClient):
 
         Returns:
             list[Path]: list containing path to the saved roster file
-            
+
         Raises:
             RuntimeError: If roster download fails or authentication expired.
         """
@@ -361,7 +368,7 @@ class GradescopeClient(LMSClient):
             lms_id = lms_resource.get_attribute("data-lms-id")
             if lms_id:
                 course_details["lms_course_id"] = lms_id
-            
+
             lms_text = lms_resource.text_content()
             if lms_text and "Linked to:" in lms_text:
                 lms_name = lms_text.split("Linked to:", 1)[1].strip()
@@ -423,7 +430,8 @@ class GradescopeClient(LMSClient):
                 courses_container = courses_for_term_divs.nth(matching_term_index)
             else:
                 logger.warning(
-                    f"Courses container index {matching_term_index} out of range (only {courses_for_term_count} containers)"
+                    f"Courses container index {matching_term_index} out of range "
+                    f"(only {courses_for_term_count} containers)"
                 )
                 browser.close()
                 return result
@@ -705,3 +713,146 @@ class GradescopeClient(LMSClient):
             except Exception as e:
                 browser.close()
                 raise RuntimeError(f"Error during roster upload: {e}") from e
+
+    def fetch_courses(self, term: str | Term | None = None, headless: bool = True) -> list[Course]:
+        """Fetch list of courses for the authenticated user.
+
+        Args:
+            term: Optional term to filter courses by (e.g., "Fall 2025" or Term object)
+            headless: Whether to run the browser in headless mode
+
+        Returns:
+            List of Course objects
+
+        Raises:
+            RuntimeError: If authentication has expired
+        """
+
+        # Ensure authentication state exists
+        if not self.auth_state_path.exists():
+            logger.warning(f"Auth state file not found at {self.auth_state_path}. Running authentication...")
+            self.authenticate(headless=headless)
+
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                result = self._fetch_courses_session(term, headless)
+                return result
+            except RuntimeError as e:
+                if attempt < max_retries:
+                    logger.warning(f"RuntimeError: {e} Authentication may have expired.")
+                    logger.info("Re-authenticating...")
+                    if self.auth_state_path.exists():
+                        self.auth_state_path.unlink()
+                    self.authenticate(headless=headless)
+                else:
+                    logger.error(f"Max retries exceeded. RuntimeError: {e}")
+                    raise
+        return []
+
+    def _fetch_courses_session(self, term: str | Term | None = None, headless: bool = True) -> list[Course]:
+        """Internal method to fetch courses in a single browser session.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        from edubag.gradescope.course import Course
+
+        result = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context(storage_state=self.auth_state_path)
+            page = context.new_page()
+
+            page.goto(self.base_url)
+            if "login" in page.url:
+                browser.close()
+                raise RuntimeError("Authentication session expired.")
+
+            # Wait for the course list to load
+            page.wait_for_load_state("networkidle")
+
+            # Convert term to string if provided
+            term_str = str(term) if term is not None else None
+
+            # Find all term divs
+            term_divs = page.locator("div.courseList--term")
+            term_count = term_divs.count()
+
+            # If term filter is specified, find only that term
+            if term_str:
+                matching_term_index = -1
+                for i in range(term_count):
+                    term_div = term_divs.nth(i)
+                    term_text = term_div.text_content()
+                    if term_text and term_str in term_text:
+                        matching_term_index = i
+                        break
+
+                if matching_term_index == -1:
+                    logger.warning(f"Term '{term_str}' not found on page")
+                    browser.close()
+                    return result
+
+                # Get courses for this specific term
+                courses_for_term_divs = page.locator("div.courseList--coursesForTerm")
+                if matching_term_index < courses_for_term_divs.count():
+                    courses_container = courses_for_term_divs.nth(matching_term_index)
+                    course_boxes = courses_container.locator("a.courseBox").all()
+                    for course_link in course_boxes:
+                        course_url = course_link.get_attribute("href")
+                        if course_url and course_url.startswith("/courses/"):
+                            # Navigate to course and extract details
+                            full_url = f"{self.base_url}{course_url}"
+                            page.goto(full_url)
+                            page.wait_for_load_state("networkidle")
+                            course_details = self._extract_course_details(page)
+                            course = Course.from_dict(course_details)
+                            result.append(course)
+                            # Go back to home page
+                            page.goto(self.base_url)
+                            page.wait_for_load_state("networkidle")
+            else:
+                # Fetch all courses for all terms
+                courses_for_term_divs = page.locator("div.courseList--coursesForTerm")
+                courses_count = courses_for_term_divs.count()
+
+                for i in range(courses_count):
+                    courses_container = courses_for_term_divs.nth(i)
+                    course_boxes = courses_container.locator("a.courseBox").all()
+                    for course_link in course_boxes:
+                        course_url = course_link.get_attribute("href")
+                        if course_url and course_url.startswith("/courses/"):
+                            # Navigate to course and extract details
+                            full_url = f"{self.base_url}{course_url}"
+                            page.goto(full_url)
+                            page.wait_for_load_state("networkidle")
+                            course_details = self._extract_course_details(page)
+                            course = Course.from_dict(course_details)
+                            result.append(course)
+                            # Go back to home page
+                            page.goto(self.base_url)
+                            page.wait_for_load_state("networkidle")
+
+            browser.close()
+        return result
+
+    def fetch_assignments(self, course_id: str, headless: bool = True) -> list[Assignment]:
+        """Fetch list of assignments for a course.
+
+        Args:
+            course_id: The Gradescope course ID
+            headless: Whether to run the browser in headless mode
+
+        Returns:
+            List of Assignment objects
+
+        Raises:
+            RuntimeError: If authentication has expired
+
+        Note:
+            This is a stub method that will be implemented with full Playwright automation.
+        """
+
+        logger.warning("GradescopeClient.fetch_assignments() is not yet fully implemented (stub)")
+        logger.info(f"Would fetch assignments for course: {course_id}")
+        return []

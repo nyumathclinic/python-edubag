@@ -214,3 +214,59 @@ class TestGradescopeClient:
             pytest.skip("Auth state not found. Run gradescope client authenticate first.")
 
         client.send_roster(course="1227659", csv_path=roster_path, headless=True)
+
+    def test_fetch_courses(self):
+        """Test fetch_courses method with mock."""
+        from edubag.gradescope.course import Course
+
+        client = GradescopeClient()
+
+        # Mock authentication state path to exist
+        with patch("pathlib.Path.exists", return_value=True):
+            # Mock the session method
+            mock_courses = [
+                Course(course_id="123456", course_name="Test Course 1"),
+                Course(course_id="789012", course_name="Test Course 2"),
+            ]
+            with patch.object(
+                client,
+                "_fetch_courses_session",
+                return_value=mock_courses,
+            ) as mock_session:
+                result = client.fetch_courses(headless=True)
+
+                # Verify the session method was called
+                mock_session.assert_called_once_with(None, True)
+                assert len(result) == 2
+
+    def test_fetch_courses_with_term_filter(self):
+        """Test fetch_courses method with term filter."""
+        from edubag.albert.term import Season, Term
+        from edubag.gradescope.course import Course
+
+        client = GradescopeClient()
+        term = Term(2025, Season.FALL)
+
+        # Mock authentication state path to exist
+        with patch("pathlib.Path.exists", return_value=True):
+            # Mock the session method
+            mock_courses = [Course(course_id="123456", course_name="Test Course")]
+            with patch.object(
+                client,
+                "_fetch_courses_session",
+                return_value=mock_courses,
+            ) as mock_session:
+                result = client.fetch_courses(term=term, headless=True)
+
+                # Verify the session method was called with the term
+                mock_session.assert_called_once_with(term, True)
+                assert len(result) == 1
+
+    def test_fetch_assignments_stub(self):
+        """Test that fetch_assignments is a stub."""
+        client = GradescopeClient()
+
+        # Mock authentication state path to exist
+        with patch("pathlib.Path.exists", return_value=True):
+            assignments = client.fetch_assignments(course_id="123456", headless=True)
+            assert assignments == []
