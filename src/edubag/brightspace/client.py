@@ -16,33 +16,34 @@ T = TypeVar("T")
 
 
 def _run_sync_in_thread(func: Callable[..., T], *args, **kwargs) -> T:
-    """Run a sync function in a separate thread to avoid asyncio event loop conflicts.
-    
-    This is needed on Python 3.13+ where Playwright's sync API detects if an event loop
-    is already running and raises an error. By running in a thread, we avoid the detection.
+    """Run sync Playwright code in a dedicated worker thread.
+
+    Python 3.13 can surface event-loop ownership edge cases where checking only
+    ``get_running_loop`` is insufficient. Always dispatching to a fresh thread
+    with an isolated event loop avoids those ambiguities.
     """
-    try:
-        asyncio.get_running_loop()
-        # Event loop is running, we need to run in a thread
-        result_container = []
-        exception_container = []
-        
-        def thread_wrapper():
-            try:
-                result_container.append(func(*args, **kwargs))
-            except Exception as e:
-                exception_container.append(e)
-        
-        thread = threading.Thread(target=thread_wrapper, daemon=False)
-        thread.start()
-        thread.join()
-        
-        if exception_container:
-            raise exception_container[0]
-        return result_container[0]
-    except RuntimeError:
-        # No event loop running, call directly
-        return func(*args, **kwargs)
+    result_container: list = []
+    exception_container: list = []
+
+    def thread_wrapper() -> None:
+        # Give this thread a fresh, isolated event loop.
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        try:
+            result_container.append(func(*args, **kwargs))
+        except Exception as exc:
+            exception_container.append(exc)
+        finally:
+            new_loop.close()
+            asyncio.set_event_loop(None)
+
+    thread = threading.Thread(target=thread_wrapper, daemon=False)
+    thread.start()
+    thread.join()
+
+    if exception_container:
+        raise exception_container[0]
+    return result_container[0]
 
 
 class BrightspaceClient(LMSClient):

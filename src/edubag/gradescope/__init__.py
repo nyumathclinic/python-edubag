@@ -439,6 +439,108 @@ def send_roster(
         raise typer.Exit(code=1)
 
 
+@client_app.command("save-scores")
+def save_scores(
+    course: Annotated[
+        str, typer.Argument(help="Gradescope course ID")
+    ],
+    assignments: Annotated[
+        List[str], typer.Argument(help="One or more Gradescope assignment IDs to download")
+    ],
+    save_dir: Annotated[
+        Path | None, typer.Option(help="Target directory for saved files")
+    ] = None,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Download scores CSV for one or more Gradescope assignments.
+
+    Downloads `<assignment>_scores.csv` for each ASSIGNMENT ID provided
+    and saves the files to SAVE_DIR (or the current directory if omitted).
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    failed = False
+    for assignment in assignments:
+        try:
+            paths = client.save_assignment_scores(
+                course=course,
+                assignment=assignment,
+                save_dir=save_dir,
+                headless=headless,
+            )
+            for p in paths:
+                typer.echo(f"Scores saved to {p}")
+        except Exception as e:
+            typer.echo(f"Failed to download scores for assignment {assignment}: {e}", err=True)
+            failed = True
+    if failed:
+        raise typer.Exit(code=1)
+
+
+@client_app.command("save-container-scores")
+def save_container_scores(
+    course: Annotated[
+        str, typer.Argument(help="Gradescope course ID")
+    ],
+    assignment_containers: Annotated[
+        List[str],
+        typer.Argument(help="One or more Gradescope assignment container IDs to download"),
+    ],
+    save_dir: Annotated[
+        Path | None, typer.Option(help="Target directory for saved files")
+    ] = None,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Download versioned scores zip for one or more Gradescope assignment containers.
+
+    Downloads `csv.zip` (a Version Set Scores zip) for each ASSIGNMENT_CONTAINER ID
+    provided and saves the files to SAVE_DIR (or the current directory if omitted).
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    failed = False
+    for container in assignment_containers:
+        try:
+            paths = client.save_assignment_container_scores(
+                course=course,
+                assignment_container=container,
+                save_dir=save_dir,
+                headless=headless,
+            )
+            for p in paths:
+                typer.echo(f"Container scores saved to {p}")
+        except Exception as e:
+            typer.echo(
+                f"Failed to download container scores for assignment_container {container}: {e}",
+                err=True,
+            )
+            failed = True
+    if failed:
+        raise typer.Exit(code=1)
+
+
 # Register the gradescope app as a subcommand with the main app
 main_app.add_typer(app, name="gradescope")
 app.add_typer(client_app, name="client")
