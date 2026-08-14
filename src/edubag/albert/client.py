@@ -7,7 +7,7 @@ from pathlib import Path
 
 import platformdirs
 from loguru import logger
-from playwright.sync_api import Locator, Page, sync_playwright
+from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from edubag.albert.term import Term
 from edubag.clients import LMSClient
@@ -99,7 +99,35 @@ class AlbertClient(LMSClient):
             else:
                 print("Please enter your username and password in the browser window, then complete MFA.")
 
-            page.wait_for_url("**/h/?tab=IS_FSA_TAB", timeout=60000)  # adjust to post-login URL
+            # Microsoft SSO occasionally inserts a "Stay signed in?" interstitial.
+            # If present, check "Don't show this again" and continue.
+            kmsi_heading = page.locator("div[role='heading']", has_text="Stay signed in?")
+            kmsi_checkbox = page.locator("#KmsiCheckboxField")
+            kmsi_submit = page.locator("#idSIButton9")
+            kmsi_seen = False
+
+            try:
+                kmsi_heading.wait_for(state="visible", timeout=15000)
+                kmsi_seen = True
+            except PlaywrightTimeoutError:
+                try:
+                    kmsi_checkbox.wait_for(state="visible", timeout=15000)
+                    kmsi_seen = True
+                except PlaywrightTimeoutError:
+                    kmsi_seen = False
+
+            if kmsi_seen:
+                if kmsi_checkbox.count() > 0 and kmsi_checkbox.is_visible() and not kmsi_checkbox.is_checked():
+                    kmsi_checkbox.check()
+                kmsi_submit.click()
+                logger.debug("Handled 'Stay signed in?' interstitial during Albert authentication")
+
+            # SAML and MFA redirects can be slow; wait for the Albert landing URL pattern.
+            page.wait_for_url(
+                re.compile(r".*/h/\?tab=IS_FSA_TAB.*"),
+                timeout=120000,
+                wait_until="domcontentloaded",
+            )
 
             context.storage_state(path=self.auth_state_path)
             logger.debug(f"Authentication state saved at {self.auth_state_path}")

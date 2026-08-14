@@ -18,6 +18,7 @@ dependencies = [
   "loguru",
   "rich",
   "bs4",
+  "lxml",
   "pandas",
   "pyyaml",
   "playwright",

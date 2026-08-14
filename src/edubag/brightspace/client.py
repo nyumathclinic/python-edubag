@@ -1,13 +1,16 @@
 """Module to automate interactions with the Brightspace learning platform."""
 
 import asyncio
+import re
 import threading
+import time
 from pathlib import Path
 from typing import Callable, TypeVar
 
 import platformdirs
 from loguru import logger
 from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from edubag.clients import LMSClient
@@ -77,6 +80,70 @@ class BrightspaceClient(LMSClient):
         else:
             self.auth_state_path = self._default_auth_state_path()
 
+    @staticmethod
+    def _handle_kmsi_interstitial(page) -> bool:
+        """Handle Microsoft 'Stay signed in?' prompt if it appears.
+
+        Returns True when the interstitial was detected and submitted.
+        """
+        kmsi_heading = page.locator("div[role='heading']", has_text="Stay signed in?")
+        kmsi_checkbox = page.locator("#KmsiCheckboxField")
+        kmsi_submit = page.locator("#idSIButton9")
+
+        heading_visible = kmsi_heading.count() > 0 and kmsi_heading.first.is_visible()
+        checkbox_visible = kmsi_checkbox.count() > 0 and kmsi_checkbox.first.is_visible()
+        if not heading_visible and not checkbox_visible:
+            return False
+
+        if checkbox_visible and not kmsi_checkbox.first.is_checked():
+            kmsi_checkbox.first.check()
+        if kmsi_submit.count() > 0 and kmsi_submit.first.is_visible():
+            kmsi_submit.first.click()
+            logger.debug("Handled 'Stay signed in?' interstitial during Brightspace authentication")
+            return True
+        return False
+
+    def _wait_for_brightspace_landing(self, page, timeout_ms: int = 120000) -> None:
+        """Wait for Brightspace landing while opportunistically handling KMSI prompt."""
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        brightspace_url = re.compile(r"https://brightspace\.nyu\.edu/d2l/.*")
+
+        while time.monotonic() < deadline:
+            if brightspace_url.match(page.url):
+                return
+
+            # KMSI may appear after Duo; dismiss it and continue redirects.
+            self._handle_kmsi_interstitial(page)
+            page.wait_for_timeout(750)
+
+        raise PlaywrightTimeoutError("Timed out waiting for Brightspace post-login landing page")
+
+    def _run_with_reauth(self, operation: Callable[[], list[Path]], headless: bool) -> list[Path]:
+        """Run an operation with one re-authentication retry on auth expiration."""
+        if not self.auth_state_path.exists():
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
+            self.authenticate(headless=headless)
+
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                return operation()
+            except RuntimeError as e:
+                if attempt < max_retries:
+                    logger.warning(f"RuntimeError: {e} Authentication may have expired.")
+                    logger.info("Re-authenticating...")
+                    if self.auth_state_path.exists():
+                        self.auth_state_path.unlink()
+                    self.authenticate(headless=headless)
+                    continue
+
+                logger.error(f"Max retries exceeded. RuntimeError: {e}")
+                raise
+
+        return []
+
     def authenticate(self, username: str | None = None, password: str | None = None, headless: bool = False) -> None:
         """Log into Brightspace and save the authentication state.
 
@@ -126,8 +193,8 @@ class BrightspaceClient(LMSClient):
                     username_field.click()
                     print("Please enter your username and password in the browser window, then complete MFA.")
 
-                # Wait for the Brightspace home page to load after successful login
-                page.wait_for_url("**/d2l/home**", timeout=60000)
+                # Wait for Brightspace landing after SSO/MFA and optional KMSI interstitial.
+                self._wait_for_brightspace_landing(page, timeout_ms=120000)
 
                 context.storage_state(path=self.auth_state_path)
                 logger.debug(f"Authentication state saved at {self.auth_state_path}")
@@ -286,29 +353,10 @@ class BrightspaceClient(LMSClient):
         Returns:
             list[Path]: Paths to the downloaded gradebook files.
         """
-        # Ensure authentication state exists; trigger a login flow if missing
-        if not self.auth_state_path.exists():
-            logger.warning(
-                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
-            )
-            self.authenticate(headless=headless)
-
-        max_retries = 1
-        for attempt in range(max_retries + 1):
-            try:
-                return self._save_gradebook_session(course, save_dir, headless)
-            except RuntimeError as e:
-                if attempt < max_retries:
-                    logger.warning(f"RuntimeError: {e} Authentication may have expired.")
-                    logger.info("Re-authenticating...")
-                    if self.auth_state_path.exists():
-                        self.auth_state_path.unlink()
-                    self.authenticate(headless=headless)
-                    continue
-                else:
-                    logger.error(f"Max retries exceeded. RuntimeError: {e}")
-                raise
-        return []
+        return self._run_with_reauth(
+            lambda: self._save_gradebook_session(course, save_dir, headless),
+            headless=headless,
+        )
 
     def _save_attendance_session(
         self,
@@ -411,26 +459,7 @@ class BrightspaceClient(LMSClient):
         Returns:
             list[Path]: Paths to the downloaded attendance register files.
         """
-        # Ensure authentication state exists; trigger a login flow if missing
-        if not self.auth_state_path.exists():
-            logger.warning(
-                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
-            )
-            self.authenticate(headless=headless)
-
-        max_retries = 1
-        for attempt in range(max_retries + 1):
-            try:
-                return self._save_attendance_session(course, save_dir, headless)
-            except RuntimeError as e:
-                if attempt < max_retries:
-                    logger.warning(f"RuntimeError: {e} Authentication may have expired.")
-                    logger.info("Re-authenticating...")
-                    if self.auth_state_path.exists():
-                        self.auth_state_path.unlink()
-                    self.authenticate(headless=headless)
-                    continue
-                else:
-                    logger.error(f"Max retries exceeded. RuntimeError: {e}")
-                raise
-        return []
+        return self._run_with_reauth(
+            lambda: self._save_attendance_session(course, save_dir, headless),
+            headless=headless,
+        )
