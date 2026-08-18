@@ -130,7 +130,7 @@ def authenticate(
         typer.echo("Authentication state saved.")
     except Exception as e:
         typer.echo(f"Authentication failed: {e}", err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
 
 
 @client_app.command("fetch-rosters")
@@ -199,6 +199,85 @@ def fetch_class_details(
         typer.echo(json.dumps(result, indent=2))
 
 
+@client_app.command("fetch-roster")
+def fetch_roster(
+    class_number: Annotated[int, typer.Argument(help="Albert class number")],
+    term: Annotated[str, typer.Argument(help="Term name or Albert code, e.g., 'Fall 2025' or 1258")],
+    instructor_id: Annotated[
+        int | None, typer.Option(help="Albert instructor ID; defaults to ALBERT_INSTRUCTOR_ID")
+    ] = None,
+    save_dir: Annotated[
+        Path | None, typer.Option(help="Directory to save the roster file")
+    ] = None,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Albert base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Fetch a class roster using its class number, term, and instructor ID."""
+    client = AlbertClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        path = client.fetch_roster(
+            class_number=class_number,
+            term=term,
+            instructor_id=instructor_id,
+            save_dir=save_dir,
+            headless=headless,
+        )
+        typer.echo(str(path))
+    except Exception as e:
+        typer.echo(f"Error fetching roster: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+
+@client_app.command("fetch-course-details")
+def fetch_course_details(
+    class_number: Annotated[int, typer.Argument(help="Albert class number")],
+    term: Annotated[str, typer.Argument(help="Term, e.g., 'Fall 2025'")],
+    instructor_id: Annotated[
+        int | None, typer.Option(help="Albert instructor ID; defaults to ALBERT_INSTRUCTOR_ID")
+    ] = None,
+    output: Annotated[Path | None, typer.Option(help="Path to save output JSON")] = None,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Albert base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Fetch course details using its class number, term, and instructor ID."""
+    client = AlbertClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        result = client.fetch_course_details(
+            class_number=class_number,
+            term=term,
+            instructor_id=instructor_id,
+            headless=headless,
+            output=output,
+        )
+        if output is None:
+            typer.echo(json.dumps(result, indent=2))
+    except Exception as e:
+        typer.echo(f"Error fetching course details: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+
 @client_app.command("mark-engaged")
 def mark_engaged(
     class_number: Annotated[int, typer.Argument(help="Class number for the course")],
@@ -226,17 +305,17 @@ def mark_engaged(
     ] = None,
 ) -> None:
     """Mark students as engaged in academic activities for a course.
-    
+
     Email addresses can be provided via --email flags or read from STDIN (one per line).
     """
     # If no email addresses provided via CLI, read from STDIN
     if not email_addresses:
         email_addresses = [line.strip() for line in sys.stdin if line.strip()]
-    
+
     if not email_addresses:
         typer.echo("Error: No email addresses provided via --email or STDIN", err=True)
-        raise typer.Exit(code=1)
-    
+        raise typer.Exit(code=1) from None
+
     client = AlbertClient(base_url=base_url, auth_state_path=auth_state_path)
     try:
         client.mark_engaged(
@@ -248,7 +327,7 @@ def mark_engaged(
         typer.echo(f"Successfully marked {len(email_addresses)} student(s) as engaged.")
     except Exception as e:
         typer.echo(f"Error marking students as engaged: {e}", err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
 
 
 # Register the albert app as a subcommand with the main app

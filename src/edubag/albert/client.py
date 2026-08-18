@@ -1,13 +1,16 @@
 """Module to automate interactions with the Albert learning platform."""
 
 import json
+import os
 import re
 from collections.abc import Generator
 from pathlib import Path
+from urllib.parse import urlencode
 
 import platformdirs
 from loguru import logger
-from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Locator, Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from edubag.albert.term import Term
 from edubag.clients import LMSClient
@@ -41,6 +44,10 @@ class AlbertClient(LMSClient):
     """
 
     base_url = "https://sis.portal.nyu.edu/psp/ihprod/EMPLOYEE/EMPL/?cmd=start"
+    course_base_url = (
+        "https://sis.nyu.edu/psc/csprod/EMPLOYEE/SA/c/"
+        "NYU_SR_FL.NYU_CLASSROSTER_FL.GBL"
+    )
 
     @staticmethod
     def _default_auth_state_path() -> Path:
@@ -57,6 +64,42 @@ class AlbertClient(LMSClient):
             self.auth_state_path = auth_state_path
         else:
             self.auth_state_path = self._default_auth_state_path()
+
+    @staticmethod
+    def _course_url(
+        course_base_url: str,
+        class_number: int | str,
+        term: int | str | Term,
+        instructor_id: int | str | None = None,
+    ) -> str:
+        """Build the Albert class roster URL for a course."""
+        if isinstance(term, Term):
+            term_code = term.code
+        elif isinstance(term, int) or term.isdigit():
+            term_code = int(term)
+        else:
+            term_code = Term.from_name(term).code
+
+        resolved_instructor_id = (
+            instructor_id if instructor_id is not None else os.getenv("ALBERT_INSTRUCTOR_ID")
+        )
+        if resolved_instructor_id is None:
+            raise ValueError(
+                "instructor_id must be provided or ALBERT_INSTRUCTOR_ID must be set"
+            )
+
+        query = urlencode(
+            {
+                "Page": "NYU_FACCLSRST_NUFL",
+                "Action": "U",
+                "ExactKeys": "Y",
+                "INSTRUCTOR_ID": resolved_instructor_id,
+                "INSTITUTION": "NYUNV",
+                "CLASS_NBR": class_number,
+                "STRM": term_code,
+            }
+        )
+        return f"{course_base_url}?{query}"
 
     def authenticate(self, username: str | None = None, password: str | None = None, headless=False) -> None:
         """Log into Albert and save the authentication state.
@@ -178,6 +221,12 @@ class AlbertClient(LMSClient):
             course.get_by_role("link", name="Class Roster").click()
         roster_page = popup_info.value
         roster_page.wait_for_url(re.compile(r".*PortalActualURL=.*"))
+        download_file_path = self._save_roster_page(roster_page, save_path)
+        roster_page.close()
+        return download_file_path
+
+    def _save_roster_page(self, roster_page: Page, save_path: Path | None = None) -> Path:
+        """Download a roster from an already-open Albert roster page."""
         section_name = roster_page.locator("#DERIVED_SSR_FC_CLASS_SECTION").text_content()
         section_name = section_name.strip() if section_name else ""
         logger.info(f"Processing roster for section: {section_name}")
@@ -193,7 +242,6 @@ class AlbertClient(LMSClient):
             download_file_path = Path(download.suggested_filename)
         logger.info(f"Downloading roster to {download_file_path}")
         download.save_as(download_file_path)
-        roster_page.close()
         return download_file_path
 
     def _extract_class_details_from_container(self, container: Locator | Page) -> dict:
@@ -337,6 +385,12 @@ class AlbertClient(LMSClient):
             course.get_by_role("link", name="Class Roster").click()
         roster_page = popup_info.value
         roster_page.wait_for_url(re.compile(r".*PortalActualURL=.*"))
+        class_details = self._extract_course_details_from_roster_page(roster_page)
+        roster_page.close()
+        return class_details
+
+    def _extract_course_details_from_roster_page(self, roster_page: Page) -> dict:
+        """Extract class details from an already-open Albert roster page."""
 
         class_details = {}
         # Extract class details from the roster page header
@@ -366,8 +420,123 @@ class AlbertClient(LMSClient):
         class_details.update(detail_page_data)
         logger.debug(f"Extracted {len(detail_page_data)} fields from full class detail page")
 
-        roster_page.close()
         return class_details
+
+    def _fetch_direct_roster_session(
+        self,
+        class_number: int | str,
+        term: str | Term,
+        instructor_id: int | str | None = None,
+        save_dir: Path | None = None,
+        headless: bool = True,
+    ) -> Path:
+        """Fetch and save a roster from a direct Albert course URL."""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context(storage_state=self.auth_state_path, accept_downloads=True)
+            page = context.new_page()
+            page.goto(self.base_url)
+            if "login" in page.url or "errorCode" in page.url:
+                browser.close()
+                raise RuntimeError("Authentication session expired.")
+            page.wait_for_load_state("networkidle")
+            page.goto(self._course_url(self.course_base_url, class_number, term, instructor_id))
+            page.wait_for_load_state("networkidle")
+            result = self._save_roster_page(page, save_dir)
+            browser.close()
+            return result
+
+    def fetch_roster(
+        self,
+        class_number: int | str,
+        term: str | Term,
+        instructor_id: int | str | None = None,
+        save_dir: Path | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        headless: bool = True,
+    ) -> Path:
+        """Fetch and save a class roster using Albert's direct course URL.
+
+        Args:
+            class_number: Albert's class number.
+            term: Academic term name or :class:`Term` instance.
+            instructor_id: Albert instructor ID. Falls back to ``ALBERT_INSTRUCTOR_ID``.
+            save_dir: Directory for the downloaded roster.
+            username: NetID used if authentication is required.
+            password: Password used if authentication is required.
+            headless: Whether to run the browser headlessly.
+        """
+        if not self.auth_state_path.exists():
+            self.authenticate(username=username, password=password, headless=headless)
+
+        for attempt in range(2):
+            try:
+                return self._fetch_direct_roster_session(
+                    class_number, term, instructor_id, save_dir, headless
+                )
+            except (TimeoutError, PlaywrightTimeoutError, RuntimeError):
+                if attempt == 1:
+                    raise
+                if self.auth_state_path.exists():
+                    self.auth_state_path.unlink()
+                self.authenticate(username=username, password=password, headless=headless)
+        raise RuntimeError("Unable to fetch roster")
+
+    def _fetch_direct_course_details_session(
+        self,
+        class_number: int | str,
+        term: str | Term,
+        instructor_id: int | str | None = None,
+        headless: bool = True,
+    ) -> dict:
+        """Fetch course details from a direct Albert course URL."""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context(storage_state=self.auth_state_path)
+            page = context.new_page()
+            page.goto(self.base_url)
+            if "login" in page.url or "errorCode" in page.url:
+                browser.close()
+                raise RuntimeError("Authentication session expired.")
+            page.wait_for_load_state("networkidle")
+            page.goto(self._course_url(self.course_base_url, class_number, term, instructor_id))
+            page.wait_for_load_state("networkidle")
+            result = self._extract_course_details_from_roster_page(page)
+            browser.close()
+            return result
+
+    def fetch_course_details(
+        self,
+        class_number: int | str,
+        term: str | Term,
+        instructor_id: int | str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        headless: bool = True,
+        output: Path | None = None,
+    ) -> dict:
+        """Fetch course details using Albert's direct course URL."""
+        if not self.auth_state_path.exists():
+            self.authenticate(username=username, password=password, headless=headless)
+
+        for attempt in range(2):
+            try:
+                result = self._fetch_direct_course_details_session(
+                    class_number, term, instructor_id, headless
+                )
+                if output is not None:
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    with output.open("w") as output_file:
+                        json.dump(result, output_file, indent=2)
+                return result
+            except (TimeoutError, PlaywrightTimeoutError, RuntimeError):
+                if attempt == 1:
+                    raise
+                if self.auth_state_path.exists():
+                    self.auth_state_path.unlink()
+                self.authenticate(username=username, password=password, headless=headless)
+        raise RuntimeError("Unable to fetch course details")
 
     def _fetch_rosters_session(
         self,
@@ -689,7 +858,7 @@ class AlbertClient(LMSClient):
                 # Find the row containing the student's email by looking for the email link
                 # Using a more precise selector to avoid substring matches
                 rows = frame.locator("tr.ps_grid-row").all()
-                
+
                 matched_row = None
                 for row in rows:
                     # Look for the email link within the row
@@ -697,7 +866,7 @@ class AlbertClient(LMSClient):
                     if email_link.count() > 0:
                         matched_row = row
                         break
-                    
+
                     # Also try looking for any link containing the email as a fallback
                     if matched_row is None:
                         any_email_link = row.locator(f"a:has-text('{email}')")

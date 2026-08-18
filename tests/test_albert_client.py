@@ -2,6 +2,7 @@
 """Tests for albert client module."""
 
 import inspect
+from urllib.parse import parse_qs, urlparse
 
 from edubag.albert.client import AlbertClient, _normalize_label
 
@@ -67,3 +68,74 @@ class TestAlbertClientMarkEngaged:
         """Test that the private helper methods exist."""
         assert hasattr(AlbertClient, "_find_academic_engagement_link")
         assert hasattr(AlbertClient, "_mark_engaged_session")
+
+
+class TestAlbertClientDirectCourseUrl:
+    """Test construction of direct Albert course URLs."""
+
+    def test_course_url_uses_term_code_and_all_required_parameters(self):
+        url = AlbertClient._course_url(
+            AlbertClient.course_base_url,
+            class_number=12345,
+            term="Fall 2025",
+            instructor_id="abc 123",
+        )
+
+        assert url.startswith(AlbertClient.course_base_url + "?")
+        assert parse_qs(urlparse(url).query) == {
+            "Page": ["NYU_FACCLSRST_NUFL"],
+            "Action": ["U"],
+            "ExactKeys": ["Y"],
+            "INSTRUCTOR_ID": ["abc 123"],
+            "INSTITUTION": ["NYUNV"],
+            "CLASS_NBR": ["12345"],
+            "STRM": ["1258"],
+        }
+
+    def test_course_url_uses_environment_instructor_id(self, monkeypatch):
+        monkeypatch.setenv("ALBERT_INSTRUCTOR_ID", "env-instructor")
+
+        url = AlbertClient._course_url("https://example.test/course", 123, "Spring 2026")
+
+        assert parse_qs(urlparse(url).query)["INSTRUCTOR_ID"] == ["env-instructor"]
+
+    def test_course_url_accepts_integer_term_code(self):
+        url = AlbertClient._course_url(
+            AlbertClient.course_base_url,
+            class_number=123,
+            term=1258,
+            instructor_id="instructor",
+        )
+
+        assert parse_qs(urlparse(url).query)["STRM"] == ["1258"]
+
+    def test_course_url_accepts_string_term_code(self):
+        url = AlbertClient._course_url(
+            AlbertClient.course_base_url,
+            class_number=123,
+            term="1258",
+            instructor_id="instructor",
+        )
+
+        assert parse_qs(urlparse(url).query)["STRM"] == ["1258"]
+
+    def test_explicit_instructor_id_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("ALBERT_INSTRUCTOR_ID", "env-instructor")
+
+        url = AlbertClient._course_url("https://example.test/course", 123, "Spring 2026", "explicit")
+
+        assert parse_qs(urlparse(url).query)["INSTRUCTOR_ID"] == ["explicit"]
+
+    def test_missing_instructor_id_is_an_error(self, monkeypatch):
+        monkeypatch.delenv("ALBERT_INSTRUCTOR_ID", raising=False)
+
+        try:
+            AlbertClient._course_url("https://example.test/course", 123, "Spring 2026")
+        except ValueError as error:
+            assert "ALBERT_INSTRUCTOR_ID" in str(error)
+        else:
+            raise AssertionError("Expected missing instructor ID to raise ValueError")
+
+    def test_direct_fetch_methods_exist(self):
+        assert callable(AlbertClient.fetch_roster)
+        assert callable(AlbertClient.fetch_course_details)
