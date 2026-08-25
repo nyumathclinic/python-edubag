@@ -139,3 +139,40 @@ class TestAlbertClientDirectCourseUrl:
     def test_direct_fetch_methods_exist(self):
         assert callable(AlbertClient.fetch_roster)
         assert callable(AlbertClient.fetch_course_details)
+
+
+class TestReconcileStaleHeaderSection:
+    """Test staleness correction for the roster header 'section' field.
+
+    Regression coverage for a bug where fetching several classes in a row
+    via direct URLs (same authenticated session) left the roster header's
+    `section` field one fetch behind the class actually requested, causing
+    the last class in a batch to be silently mislabeled and dropped by
+    downstream `drop_duplicates(subset=["section"])` processing.
+    """
+
+    def test_corrects_stale_section_using_full_course_name(self):
+        class_details = {
+            "section": "016",
+            "full_course_name": "MATH-UA 120 - 020 Discrete Mathematics",
+        }
+        AlbertClient._reconcile_stale_header_section(class_details)
+        assert class_details["section"] == "020"
+
+    def test_leaves_matching_section_untouched(self):
+        class_details = {
+            "section": "020",
+            "full_course_name": "MATH-UA 120 - 020 Discrete Mathematics",
+        }
+        AlbertClient._reconcile_stale_header_section(class_details)
+        assert class_details["section"] == "020"
+
+    def test_leaves_section_untouched_without_full_course_name(self):
+        class_details = {"section": "016"}
+        AlbertClient._reconcile_stale_header_section(class_details)
+        assert class_details["section"] == "016"
+
+    def test_leaves_section_untouched_when_name_unparseable(self):
+        class_details = {"section": "016", "full_course_name": "Discrete Mathematics"}
+        AlbertClient._reconcile_stale_header_section(class_details)
+        assert class_details["section"] == "016"

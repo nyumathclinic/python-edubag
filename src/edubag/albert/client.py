@@ -420,7 +420,40 @@ class AlbertClient(LMSClient):
         class_details.update(detail_page_data)
         logger.debug(f"Extracted {len(detail_page_data)} fields from full class detail page")
 
+        self._reconcile_stale_header_section(class_details)
+
         return class_details
+
+    @staticmethod
+    def _reconcile_stale_header_section(class_details: dict) -> None:
+        """Correct `section` when it lags the roster header component.
+
+        The roster page header (`#win0divROSTER_HDRGRP`) is read immediately
+        after navigation and can still reflect whichever class was last
+        loaded in this authenticated session, one fetch behind the class
+        just requested -- this shows up when scraping several classes in a
+        row via direct URLs. `full_course_name` (e.g. "MATH-UA 120 - 020
+        Discrete Mathematics") comes from a part of the page that has
+        consistently reflected the class actually requested, so use it to
+        detect and correct a stale `section` value.
+        """
+        full_course_name = class_details.get("full_course_name")
+        if not isinstance(full_course_name, str):
+            return
+        match = re.search(r"\s-\s*(\d{2,4})\s", full_course_name)
+        if not match:
+            return
+        derived_section = match.group(1)
+        header_section = class_details.get("section")
+        if header_section is not None and str(header_section).strip() == derived_section:
+            return
+        logger.warning(
+            "Roster header 'section' looks stale (got "
+            f"'{header_section}', full_course_name implies '{derived_section}'); "
+            "correcting. Other header-only fields (class_type, instructor, "
+            "days_and_times) may still be stale for this class."
+        )
+        class_details["section"] = derived_section
 
     def _fetch_direct_roster_session(
         self,
