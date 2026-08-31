@@ -576,7 +576,9 @@ class GradescopeClient(LMSClient):
 
         # Ensure authentication state exists; trigger a login flow if missing
         if not self.auth_state_path.exists():
-            logger.warning(f"Auth state file not found at {self.auth_state_path}. Running authentication...")
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
             self.authenticate(headless=headless)
 
         max_retries = 1

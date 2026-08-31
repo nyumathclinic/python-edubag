@@ -204,7 +204,13 @@ def main() -> int:
                 _click_first(page, flow_logger, "login_open_form", login_candidates)
                 email = page.get_by_role("textbox", name=re.compile("Email", re.IGNORECASE))
                 password_box = page.get_by_role("textbox", name=re.compile("Password", re.IGNORECASE))
-                if username and password and probe_locator(email)["visible"] and probe_locator(password_box)["visible"]:
+                can_fill_credentials = (
+                    username
+                    and password
+                    and probe_locator(email)["visible"]
+                    and probe_locator(password_box)["visible"]
+                )
+                if can_fill_credentials:
                     email.first.fill(username)
                     password_box.first.fill(password)
                     _click_first(

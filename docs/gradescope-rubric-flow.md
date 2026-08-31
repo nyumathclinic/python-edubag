@@ -12,7 +12,7 @@ iteratively validated.
 
 ## Required environment/configuration
 
-- Run from repository root: `/home/runner/work/python-edubag/python-edubag`
+- Run from the repository root directory (`.`)
 - Use existing secure credential approach already used by `GradescopeClient`:
   - optional `.env` keys: `GRADESCOPE_USERNAME`, `GRADESCOPE_PASSWORD`
   - existing storage state file from `edubag gradescope client authenticate`
