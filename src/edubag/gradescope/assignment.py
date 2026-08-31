@@ -75,6 +75,23 @@ class Assignment:
         logger.warning("Assignment.delete() is not yet implemented (stub)")
         logger.info(f"Would delete assignment: {self.name} (id={self.assignment_id})")
 
+    def upload_rubric(self, rubric_path: Path, mode: str = "replace") -> None:
+        """Upload or import a rubric for this assignment (placeholder).
+
+        Args:
+            rubric_path: Local rubric file path.
+            mode: Intended future behavior (e.g., ``replace`` or ``merge``).
+
+        Note:
+            Discovery flow currently lives in ``scripts/discover_rubric_flow.py``.
+            Full upload automation is intentionally not implemented yet.
+        """
+        logger.warning("Assignment.upload_rubric() is not yet implemented (stub)")
+        logger.info(
+            f"TODO: wire rubric upload flow for assignment {self.assignment_id} "
+            f"using discovery artifacts; requested rubric={rubric_path} mode={mode}"
+        )
+
     @classmethod
     def create(
         cls,

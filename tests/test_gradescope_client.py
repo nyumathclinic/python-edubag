@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from edubag.albert.term import Season, Term
-from edubag.gradescope.client import GradescopeClient
+from edubag.albert.term import Season, Term  # noqa: E402
+from edubag.gradescope.client import GradescopeClient  # noqa: E402
 
 
 class TestGradescopeClient:
@@ -54,7 +54,7 @@ class TestGradescopeClient:
         mock_course_number = Mock()
         mock_course_number.count.return_value = 1
         mock_course_number.text_content.return_value = "MATH-UA 122.006"
-        
+
         # Setup locator side effects
         def locator_side_effect(selector):
             if selector == "h1.courseHeader--title":
@@ -270,3 +270,13 @@ class TestGradescopeClient:
         with patch("pathlib.Path.exists", return_value=True):
             assignments = client.fetch_assignments(course_id="123456", headless=True)
             assert assignments == []
+
+    def test_upload_assignment_rubric_stub(self):
+        """Test that upload_assignment_rubric is a stub."""
+        client = GradescopeClient()
+        client.upload_assignment_rubric(
+            course_id="123456",
+            assignment_id="789",
+            rubric_path=Path("/tmp/rubric.csv"),
+            headless=True,
+        )

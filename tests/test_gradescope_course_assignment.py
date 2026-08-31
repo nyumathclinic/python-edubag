@@ -181,6 +181,15 @@ class TestAssignment:
         # This should not raise an error, just log warnings
         assignment.delete()
 
+    def test_assignment_upload_rubric_stub(self):
+        """Test that upload_rubric is a stub."""
+        assignment = Assignment(
+            assignment_id="789",
+            name="Quiz 1",
+            course_id="123456",
+        )
+        assignment.upload_rubric(Path("/tmp/rubric.csv"))
+
     def test_assignment_from_dict_with_none_values(self):
         """Test creating an assignment from a dictionary with None values."""
         data = {

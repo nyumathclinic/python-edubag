@@ -287,7 +287,9 @@ class GradescopeClient(LMSClient):
         """
         # Ensure authentication state exists; trigger a login flow if missing
         if not self.auth_state_path.exists():
-            logger.warning(f"Auth state file not found at {self.auth_state_path}. Running authentication...")
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
             self.authenticate(headless=headless)
 
         max_retries = 1
@@ -574,9 +576,7 @@ class GradescopeClient(LMSClient):
 
         # Ensure authentication state exists; trigger a login flow if missing
         if not self.auth_state_path.exists():
-            logger.warning(
-                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
-            )
+            logger.warning(f"Auth state file not found at {self.auth_state_path}. Running authentication...")
             self.authenticate(headless=headless)
 
         max_retries = 1
@@ -855,4 +855,27 @@ class GradescopeClient(LMSClient):
 
         logger.warning("GradescopeClient.fetch_assignments() is not yet fully implemented (stub)")
         logger.info(f"Would fetch assignments for course: {course_id}")
+        logger.info(
+            "TODO: discover assignment rubric controls first, then wire Assignment.upload_rubric() integration."
+        )
         return []
+
+    def upload_assignment_rubric(
+        self,
+        course_id: str,
+        assignment_id: str,
+        rubric_path: Path,
+        mode: str = "replace",
+        headless: bool = True,
+    ) -> None:
+        """Placeholder for future assignment rubric upload automation.
+
+        Note:
+            This method is intentionally a stub until selectors/flow are validated
+            via ``scripts/discover_rubric_flow.py``.
+        """
+        logger.warning("GradescopeClient.upload_assignment_rubric() is not yet implemented (stub)")
+        logger.info(
+            f"Would upload rubric for course={course_id} assignment={assignment_id} "
+            f"rubric_path={rubric_path} mode={mode} headless={headless}"
+        )
