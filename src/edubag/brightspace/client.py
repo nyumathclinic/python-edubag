@@ -345,7 +345,24 @@ class BrightspaceClient(LMSClient):
 
                 # Navigate to Grades
                 page.get_by_role("link", name="Grades").click()
-                page.get_by_role("link", name="Enter Grades  selected").click()
+
+                enter_grades_url = re.compile(r".*grades/admin/enter/user_list_view\.d2l.*")
+                if not enter_grades_url.search(page.url):
+                    # "Grades" usually opens a flyout submenu with an "Enter
+                    # Grades" link. D2L appends a hidden " selected" suffix to
+                    # that link's accessible name only when it's already the
+                    # active nav item, so match on the stable "Enter Grades"
+                    # substring instead of requiring that suffix. For some
+                    # course configurations (e.g. coordinated/cross-listed
+                    # sections with only one grades tool enabled), clicking
+                    # "Grades" navigates straight to the Enter Grades page
+                    # instead of opening a flyout, so tolerate that link never
+                    # appearing -- the wait_for_url below is the real check.
+                    try:
+                        page.get_by_role("link", name="Enter Grades").first.click(timeout=10000)
+                    except PlaywrightError:
+                        pass
+
                 page.wait_for_url("**/grades/admin/enter/user_list_view.d2l**", timeout=30000)
                 page.wait_for_load_state("networkidle", timeout=30000)
 
