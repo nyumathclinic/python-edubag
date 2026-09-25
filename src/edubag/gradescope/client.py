@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, TypeVar
+from urllib.parse import urljoin
 
 import platformdirs
 from dotenv import load_dotenv
@@ -918,3 +919,239 @@ class GradescopeClient(LMSClient):
                     raise RuntimeError(f"Error during roster upload: {e}") from e
 
         _run_sync_in_thread(_do)
+
+    def list_assignments(self, course: str, headless: bool = True) -> list[dict]:
+        """Fetch the assignment/quiz-container list from a course's Assignments page.
+
+        Args:
+            course: Gradescope course ID or URL to the course home page.
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            list[dict]: Raw ``table_data`` entries from the Assignments page, mixing
+                ``type: "assignment"`` and ``type: "assignment_container"`` records.
+                Each entry has a ``url`` field (relative path) usable for further requests.
+
+        Raises:
+            RuntimeError: If authentication has expired.
+        """
+        if not self.auth_state_path.exists():
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
+            self.authenticate(headless=headless)
+
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                return self._list_assignments_session(course, headless)
+            except RuntimeError as e:
+                if attempt < max_retries:
+                    logger.warning(f"RuntimeError: {e} Re-authenticating...")
+                    if self.auth_state_path.exists():
+                        self.auth_state_path.unlink()
+                    self.authenticate(headless=headless)
+                    continue
+                logger.error(f"Max retries exceeded. RuntimeError: {e}")
+                raise
+        return []
+
+    def _list_assignments_session(self, course: str, headless: bool) -> list[dict]:
+        """Internal: fetch the Assignments page's embedded table data in one browser session.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do() -> list[dict]:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                page = context.new_page()
+
+                if course.startswith("http://") or course.startswith("https://"):
+                    course_url = course.rstrip("/")
+                else:
+                    course_url = f"{self.base_url}/courses/{course}"
+                page.goto(f"{course_url}/assignments")
+                page.wait_for_load_state("networkidle")
+
+                if "login" in page.url:
+                    browser.close()
+                    raise RuntimeError("Authentication session expired. Please re-authenticate.")
+
+                # The Assignments page renders its full table as one embedded JSON blob.
+                table = page.locator('[data-react-class="AssignmentsTable"]')
+                table_data = []
+                if table.count() > 0:
+                    props = json.loads(table.get_attribute("data-react-props") or "{}")
+                    table_data = props.get("table_data", [])
+
+                browser.close()
+                return table_data
+
+        return _run_sync_in_thread(_do)
+
+    def post_all_grades(self, course: str, headless: bool = True) -> list[dict]:
+        """Post grades to the linked LMS for every eligible assignment in a course.
+
+        For each standalone assignment or quiz/exam version-container (individual quiz
+        versions are skipped; their container posts grades for all versions at once),
+        visits its Review Grades page and, if grades are published there and an LMS
+        resource link is present, POSTs to the same endpoint the "Post Grades" button
+        uses.
+
+        Args:
+            course: Gradescope course ID or URL to the course home page.
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            list[dict]: One result dict per assignment/container attempted, each with
+                ``id``, ``title``, ``type``, ``url`` and ``status`` (one of
+                ``"posted"``, ``"skipped-unpublished"``, ``"skipped-not-linked"``,
+                ``"skipped-no-grades"``, ``"error"``), plus ``detail`` on error.
+
+        Raises:
+            RuntimeError: If authentication has expired.
+        """
+        if not self.auth_state_path.exists():
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
+            self.authenticate(headless=headless)
+
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                return self._post_all_grades_session(course, headless)
+            except RuntimeError as e:
+                if attempt < max_retries:
+                    logger.warning(f"RuntimeError: {e} Re-authenticating...")
+                    if self.auth_state_path.exists():
+                        self.auth_state_path.unlink()
+                    self.authenticate(headless=headless)
+                    continue
+                logger.error(f"Max retries exceeded. RuntimeError: {e}")
+                raise
+        return []
+
+    def _post_all_grades_session(self, course: str, headless: bool) -> list[dict]:
+        """Internal: enumerate and post grades for one course in a single browser session.
+
+        Raises RuntimeError if authentication has expired or the Assignments page
+        can't be loaded; per-assignment failures are captured in the returned results
+        instead of raising, so one bad assignment doesn't abort the whole course.
+        """
+        def _do() -> list[dict]:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                page = context.new_page()
+
+                if course.startswith("http://") or course.startswith("https://"):
+                    course_url = course.rstrip("/")
+                else:
+                    course_url = f"{self.base_url}/courses/{course}"
+                page.goto(f"{course_url}/assignments")
+                page.wait_for_load_state("networkidle")
+
+                if "login" in page.url:
+                    browser.close()
+                    raise RuntimeError("Authentication session expired. Please re-authenticate.")
+
+                table = page.locator('[data-react-class="AssignmentsTable"]')
+                table_data = []
+                if table.count() > 0:
+                    props = json.loads(table.get_attribute("data-react-props") or "{}")
+                    table_data = props.get("table_data", [])
+
+                results: list[dict] = []
+                for entry in table_data:
+                    entry_type = entry.get("type")
+                    entry_url = entry.get("url")
+                    if entry_type != "assignment_container" and entry_type != "assignment":
+                        continue
+                    if entry_type == "assignment" and entry.get("container_id"):
+                        # An individual quiz/exam version; its container posts for all versions.
+                        continue
+                    if not entry_url:
+                        continue
+
+                    result = {
+                        "id": entry.get("id"),
+                        "title": entry.get("title"),
+                        "type": entry_type,
+                        "url": entry_url,
+                    }
+
+                    try:
+                        review_url = f"{self.base_url}{entry_url}/review_grades"
+                        page.goto(review_url)
+                        page.wait_for_load_state("networkidle")
+
+                        if "login" in page.url:
+                            browser.close()
+                            raise RuntimeError(
+                                "Authentication session expired. Please re-authenticate."
+                            )
+
+                        # Gradescope only shows this button after grades have been published.
+                        if page.get_by_role("button", name="Unpublish All Grades").count() == 0:
+                            result["status"] = "skipped-unpublished"
+                            results.append(result)
+                            continue
+
+                        post_grades_el = page.locator('[data-react-class="PostGrades"]')
+                        if post_grades_el.count() == 0:
+                            result["status"] = "skipped-not-linked"
+                            results.append(result)
+                            continue
+
+                        post_props = json.loads(
+                            post_grades_el.get_attribute("data-react-props") or "{}"
+                        )
+                        post_grades_path = post_props.get("postGradesPath")
+                        if not post_props.get("gradesPresent") or not post_grades_path:
+                            result["status"] = "skipped-no-grades"
+                            results.append(result)
+                            continue
+
+                        csrf_token = page.locator('meta[name="csrf-token"]').get_attribute(
+                            "content"
+                        )
+                        # Resolve against page.url (not self.base_url): gradescope.com redirects
+                        # to www.gradescope.com, and a POST across that redirect gets downgraded
+                        # to a GET, 404-ing on this POST-only route.
+                        post_url = urljoin(page.url, post_grades_path)
+                        response = page.request.post(
+                            post_url,
+                            headers={
+                                "X-CSRF-Token": csrf_token or "",
+                                "Accept": "application/json",
+                            },
+                        )
+                        if response.ok:
+                            result["status"] = "posted"
+                            result["lms_name"] = post_props.get("lmsName")
+                            logger.success(
+                                f"Posted grades for '{entry.get('title')}' to "
+                                f"{post_props.get('lmsName')}"
+                            )
+                        else:
+                            result["status"] = "error"
+                            result["detail"] = f"HTTP {response.status}: {response.text()}"
+                            logger.error(
+                                f"Failed to post grades for '{entry.get('title')}': "
+                                f"{result['detail']}"
+                            )
+                    except RuntimeError:
+                        raise
+                    except Exception as exc:
+                        result["status"] = "error"
+                        result["detail"] = str(exc)
+                        logger.error(f"Error posting grades for '{entry.get('title')}': {exc}")
+
+                    results.append(result)
+
+                browser.close()
+                return results
+
+        return _run_sync_in_thread(_do)
