@@ -1033,6 +1033,17 @@ class GradescopeClient(LMSClient):
                 raise
         return []
 
+    @staticmethod
+    def _is_assignment_published(entry: dict, page: Page) -> bool:
+        is_published = entry.get("is_published")
+        if is_published is not None:
+            return bool(is_published)
+
+        return any(
+            page.get_by_role("button", name=label).count() > 0
+            for label in ("Unpublish Grades", "Unpublish All Grades")
+        )
+
     def _post_all_grades_session(self, course: str, headless: bool) -> list[dict]:
         """Internal: enumerate and post grades for one course in a single browser session.
 
@@ -1093,8 +1104,7 @@ class GradescopeClient(LMSClient):
                                 "Authentication session expired. Please re-authenticate."
                             )
 
-                        # Gradescope only shows this button after grades have been published.
-                        if page.get_by_role("button", name="Unpublish All Grades").count() == 0:
+                        if not self._is_assignment_published(entry, page):
                             result["status"] = "skipped-unpublished"
                             results.append(result)
                             continue

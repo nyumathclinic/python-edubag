@@ -18,6 +18,32 @@ from edubag.gradescope.client import GradescopeClient
 class TestGradescopeClient:
     """Test the GradescopeClient class."""
 
+    @pytest.mark.parametrize(
+        ("is_published", "expected"),
+        [(True, True), (False, False)],
+    )
+    def test_assignment_publication_uses_table_metadata(self, is_published, expected):
+        page = Mock()
+
+        result = GradescopeClient._is_assignment_published(
+            {"is_published": is_published}, page
+        )
+
+        assert result is expected
+        page.get_by_role.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "button_name",
+        ["Unpublish Grades", "Unpublish All Grades"],
+    )
+    def test_assignment_publication_falls_back_to_unpublish_button(self, button_name):
+        page = Mock()
+        page.get_by_role.side_effect = lambda *args, **kwargs: Mock(
+            count=Mock(return_value=kwargs["name"] == button_name)
+        )
+
+        assert GradescopeClient._is_assignment_published({}, page)
+
     def test_client_initialization(self):
         """Test basic client initialization."""
         client = GradescopeClient()
