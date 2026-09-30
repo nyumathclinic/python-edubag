@@ -4,7 +4,23 @@
 import inspect
 from datetime import date, datetime
 
-from edubag.polleverywhere.client import Assignment, Class, Client, _parse_timestamp
+import pytest
+
+from edubag.polleverywhere.client import Assignment, Class, Client, _parse_timestamp, _run_sync_in_thread
+
+
+class TestRunSyncInThread:
+    """Test the _run_sync_in_thread helper function."""
+
+    def test_returns_function_result(self):
+        assert _run_sync_in_thread(lambda x, y: x + y, 2, 3) == 5
+
+    def test_propagates_exceptions(self):
+        def _raises():
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            _run_sync_in_thread(_raises)
 
 
 class TestParseTimestamp:

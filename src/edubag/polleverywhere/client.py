@@ -499,6 +499,10 @@ class Client(LMSClient):
                 self._check_authenticated(page)
 
                 try:
+                    # Gather eligible assignments into a plain list first, since
+                    # clicking "Sync Grades" reloads/morphs the table and would
+                    # invalidate a live, index-based locator collection.
+                    eligible: list[tuple[int, str]] = []
                     rows = page.locator("tr[id^='lms_lti_advantage_assignment_']")
                     for i in range(rows.count()):
                         row = rows.nth(i)
@@ -515,7 +519,12 @@ class Client(LMSClient):
 
                         cells = row.locator("td")
                         name = (cells.nth(0).text_content() or "").strip()
+                        eligible.append((assignment_id, name))
 
+                    for assignment_id, name in eligible:
+                        sync_button = page.locator(
+                            f"tr#lms_lti_advantage_assignment_{assignment_id} form[action$='/sync'] button"
+                        )
                         sync_button.click()
                         page.wait_for_load_state("networkidle")
                         assignment = Assignment(id=assignment_id, name=name, class_id=cls.id)
