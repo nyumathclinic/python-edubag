@@ -137,7 +137,7 @@ class TestSyncAssignmentToLmsValidation:
         else:
             raise AssertionError("Expected missing class_id to raise ValueError")
 
-    def test_does_not_raise_value_error_with_class_id_argument(self, monkeypatch):
+    def test_does_not_raise_value_error_with_class_id_argument(self):
         # Should get past the class_id validation and attempt to launch a browser,
         # which will fail in this sandboxed/headless-less test environment with
         # something other than a ValueError.

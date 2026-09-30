@@ -152,7 +152,11 @@ class Client(LMSClient):
         return f"{self.base_url}/lms/lti_advantage/user_connections"
 
     def _class_url(self, class_id: int) -> str:
-        """URL of the Course Gradebook page for a class."""
+        """URL of a single connected class.
+
+        This is the same page that shows the class's Gradebook (with its
+        assignments and "Sync Grades" buttons) and its "Sync Roster" button.
+        """
         return f"{self.courses_url}/{class_id}"
 
     def authenticate(self, username: str | None = None, password: str | None = None, headless: bool = False) -> None:
