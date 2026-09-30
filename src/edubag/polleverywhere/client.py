@@ -130,6 +130,7 @@ class Client(LMSClient):
     """
 
     base_url = "https://www.polleverywhere.com"
+    login_url = "https://id.polleverywhere.com/login"
 
     @staticmethod
     def _default_auth_state_path() -> Path:
@@ -185,7 +186,7 @@ class Client(LMSClient):
                 context = browser.new_context()
                 page = context.new_page()
 
-                page.goto(self.base_url)
+                page.goto(self.login_url)
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
 
                 email_field = page.locator("input#email")
