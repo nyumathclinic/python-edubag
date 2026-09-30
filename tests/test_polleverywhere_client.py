@@ -156,22 +156,16 @@ class TestSyncAssignmentToLmsValidation:
     def test_does_not_raise_value_error_with_class_id_argument(self):
         # Should get past the class_id validation and attempt to launch a browser,
         # which will fail in this sandboxed/headless-less test environment with
-        # something other than a ValueError.
+        # something other than a ValueError (Playwright browsers aren't installed).
         client = Client(auth_state_path="/tmp/polleverywhere_auth_test.json")
         assignment = Assignment(id=1, name="Quiz 1")
-        try:
+        with pytest.raises(Exception) as excinfo:
             client.sync_assignment_to_lms(assignment, class_id=123)
-        except ValueError:
-            raise AssertionError("Did not expect a ValueError when class_id is provided") from None
-        except Exception:
-            pass
+        assert not isinstance(excinfo.value, ValueError)
 
     def test_does_not_raise_value_error_with_assignment_class_id(self):
         client = Client(auth_state_path="/tmp/polleverywhere_auth_test.json")
         assignment = Assignment(id=1, name="Quiz 1", class_id=123)
-        try:
+        with pytest.raises(Exception) as excinfo:
             client.sync_assignment_to_lms(assignment)
-        except ValueError:
-            raise AssertionError("Did not expect a ValueError when assignment.class_id is set") from None
-        except Exception:
-            pass
+        assert not isinstance(excinfo.value, ValueError)

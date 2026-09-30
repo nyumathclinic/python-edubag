@@ -11,6 +11,7 @@ from typing import TypeVar
 
 import platformdirs
 from loguru import logger
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -528,7 +529,7 @@ class Client(LMSClient):
                         try:
                             sync_button.click(timeout=15000)
                             page.wait_for_load_state("networkidle")
-                        except PlaywrightTimeoutError as e:
+                        except (PlaywrightTimeoutError, PlaywrightError) as e:
                             logger.warning(f"Could not sync assignment {assignment_id} ({name}): {e}")
                             continue
                         assignment = Assignment(id=assignment_id, name=name, class_id=cls.id)
