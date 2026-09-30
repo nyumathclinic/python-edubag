@@ -525,8 +525,12 @@ class Client(LMSClient):
                         sync_button = page.locator(
                             f"tr#lms_lti_advantage_assignment_{assignment_id} form[action$='/sync'] button"
                         )
-                        sync_button.click()
-                        page.wait_for_load_state("networkidle")
+                        try:
+                            sync_button.click(timeout=15000)
+                            page.wait_for_load_state("networkidle")
+                        except PlaywrightTimeoutError as e:
+                            logger.warning(f"Could not sync assignment {assignment_id} ({name}): {e}")
+                            continue
                         assignment = Assignment(id=assignment_id, name=name, class_id=cls.id)
                         synced.append(assignment)
                         logger.info(f"Synced grades for assignment {assignment_id} ({name})")
