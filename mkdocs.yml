@@ -41,6 +41,7 @@ nav:
     - edstem: api/edstem.md
     - gmail: api/gmail.md
     - gradescope: api/gradescope.md
+    - polleverywhere: api/polleverywhere.md
     - edubag: api/edubag.md
 
 markdown_extensions:
