@@ -700,6 +700,42 @@ def save_attendance(
         typer.echo(str(p))
 
 
+@client_app.command("save-gradebook-structure")
+def save_gradebook_structure(
+    course: Annotated[str, typer.Argument(help="Course ID (ou)")],
+    save_dir: Annotated[
+        Path | None, typer.Option(help="Directory to save the JSON file")
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Only crawl the first N grade objects (for testing)"),
+    ] = None,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Save every grade object's settings (no grades) from Manage Grades as JSON."""
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    paths = client.save_gradebook_structure(
+        course=course,
+        save_dir=save_dir,
+        headless=headless,
+        limit=limit,
+    )
+    for p in paths:
+        typer.echo(str(p))
+
+
 @client_app.command("clear-grades")
 def clear_grades(
     course: Annotated[

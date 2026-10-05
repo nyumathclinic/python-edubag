@@ -1,10 +1,12 @@
 """Module to automate interactions with the Brightspace learning platform."""
 
 import asyncio
+import json
 import re
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
@@ -14,6 +16,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from edubag.brightspace import manage_grades
 from edubag.clients import LMSClient
 
 T = TypeVar("T")
@@ -759,3 +762,113 @@ class BrightspaceClient(LMSClient):
             headless=headless,
         )
         return failures
+
+    def _save_gradebook_structure_session(
+        self,
+        course: str,
+        save_dir: Path | None = None,
+        headless: bool = True,
+        limit: int | None = None,
+    ) -> list[Path]:
+        """Internal method to crawl Manage Grades in a single browser session.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do_save_structure():
+            blocked: list[str] = []
+
+            def _guard(route):
+                request = route.request
+                if manage_grades.is_read_only_request(request.method, request.url):
+                    route.continue_()
+                else:
+                    blocked.append(f"{request.method} {request.url}")
+                    route.abort()
+
+            def _load(page, url: str) -> None:
+                page.goto(url)
+                if "login" in page.url:
+                    logger.error("Authentication session expired. Please re-authenticate.")
+                    raise RuntimeError("Authentication session expired.")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except PlaywrightTimeoutError:
+                    logger.debug(f"Network never went idle on {url}; extracting anyway")
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                # Hard guarantee that the crawl is read-only and never opens Enter Grades.
+                context.route("**/*", _guard)
+                page = context.new_page()
+
+                try:
+                    list_url = manage_grades.manage_grades_url(self.base_url, course)
+                    _load(page, list_url)
+                    grade_list = page.evaluate(manage_grades.EXTRACT_GRADE_LIST_JS)
+                    rows = grade_list["rows"]
+                    logger.info(f"Found {len(rows)} grade objects on Manage Grades")
+                    if limit is not None:
+                        rows = rows[:limit]
+
+                    for position, row in enumerate(rows, start=1):
+                        logger.info(f"[{position}/{len(rows)}] {row['kind']}: {row['name']}")
+                        row["tabs"] = {}
+                        tab_urls = manage_grades.edit_tab_urls(self.base_url, course, row["kind"], row["id"])
+                        for tab, url in tab_urls.items():
+                            try:
+                                _load(page, url)
+                                panel = page.evaluate(manage_grades.EXTRACT_TAB_PANEL_JS)
+                                row["tabs"][tab] = {"url": url, **panel}
+                            except PlaywrightError as e:
+                                logger.error(f"Failed to read {tab} for {row['name']}: {e}")
+                                row["tabs"][tab] = {"url": url, "error": str(e)}
+                finally:
+                    browser.close()
+
+            for request in blocked:
+                logger.debug(f"Blocked non-read-only request: {request}")
+
+            structure = {
+                "course": course,
+                "base_url": self.base_url,
+                "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "manage_grades_url": list_url,
+                "columns": grade_list["columns"],
+                "grade_objects": rows,
+            }
+            filename = f"gradebook_structure_{course}_{datetime.now():%Y-%m-%d}.json"
+            path = (save_dir / filename) if save_dir is not None else Path(filename)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(structure, indent=2, ensure_ascii=False))
+            logger.info(f"Saved gradebook structure to {path}")
+            return [path]
+
+        return _run_sync_in_thread(_do_save_structure)
+
+    def save_gradebook_structure(
+        self,
+        course: str,
+        save_dir: Path | None = None,
+        headless: bool = True,
+        limit: int | None = None,
+    ) -> list[Path]:
+        """Crawl Manage Grades and save every grade object's settings as JSON.
+
+        Visits each grade item, category and final grade's edit tabs
+        (Properties, Restrictions, Objectives) and records their fields. No
+        grades are read: Enter Grades pages and all writes are blocked.
+
+        Args:
+          * course: The course org unit ID (``ou``)
+          * save_dir: directory to save the file in (default: current working directory)
+          * headless: Whether to run the browser in headless mode
+          * limit: Only crawl the first ``limit`` grade objects (for testing)
+
+        Returns:
+            list[Path]: Path to the saved JSON file.
+        """
+        return self._run_with_reauth(
+            lambda: self._save_gradebook_structure_session(course, save_dir, headless, limit),
+            headless=headless,
+        )
