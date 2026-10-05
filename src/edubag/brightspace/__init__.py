@@ -736,6 +736,72 @@ def save_gradebook_structure(
         typer.echo(str(p))
 
 
+@client_app.command("set-start-dates")
+def set_start_dates(
+    course: Annotated[str, typer.Argument(help="Course ID (ou)")],
+    schedule_file: Annotated[
+        Path,
+        typer.Argument(help='JSON file mapping dates to grade item IDs, e.g. {"2026-09-03": 1926725}'),
+    ],
+    at: Annotated[
+        str, typer.Option("--time", help="Start time (24-hour HH:MM, course local time)")
+    ] = "12:00",
+    only: Annotated[
+        list[int] | None,
+        typer.Option(help="Only update this grade item ID (repeatable)"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Fill in each Restrictions form without saving"),
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Set each grade item's start date to the Friday after its listed date.
+
+    Example:
+        python -m edubag brightspace client set-start-dates 611388 polls.json --only 1940969 --headed
+    """
+    from datetime import date, datetime
+
+    from edubag.brightspace.manage_grades import following_weekday
+
+    try:
+        start_time = datetime.strptime(at, "%H:%M").time()
+        mapping = yaml.safe_load(schedule_file.read_text())
+        schedule = {
+            int(item_id): following_weekday(date.fromisoformat(str(day)), at=start_time)
+            for day, item_id in mapping.items()
+        }
+    except (ValueError, AttributeError) as e:
+        raise typer.BadParameter(str(e)) from e
+    if only:
+        missing = set(only) - set(schedule)
+        if missing:
+            raise typer.BadParameter(f"Not in {schedule_file}: {sorted(missing)}")
+        schedule = {item_id: start for item_id, start in schedule.items() if item_id in only}
+
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    results = client.set_start_dates(course, schedule, headless=headless, dry_run=dry_run)
+    for item_id, r in results.items():
+        before = (r.get("before") or {}).get("value") or "none"
+        typer.echo(f"{r['status']:>9}  {item_id}  {r.get('name', '')}: {before} -> {r['target']}"
+                   + (f"  ({r['error']})" if "error" in r else ""))
+    if any(r["status"] == "failed" for r in results.values()):
+        raise typer.Exit(code=1)
+
+
 @client_app.command("clear-grades")
 def clear_grades(
     course: Annotated[

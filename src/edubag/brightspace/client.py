@@ -872,3 +872,142 @@ class BrightspaceClient(LMSClient):
             lambda: self._save_gradebook_structure_session(course, save_dir, headless, limit),
             headless=headless,
         )
+
+    @staticmethod
+    def _read_start_date(page) -> dict:
+        """Current "Has Start Date" state and value from a loaded Restrictions tab."""
+        panel = page.evaluate(manage_grades.EXTRACT_TAB_PANEL_JS)
+        picker = next(
+            (f for f in panel["fields"] if f.get("control") == "d2l-input-date-time" and f.get("label") == "Start Date"),
+            None,
+        )
+        if picker is None:
+            raise LookupError("Start date picker not found on Restrictions tab")
+        # A disabled picker still holds a placeholder date, so only report it when enabled.
+        return {"enabled": picker["enabled"], "value": picker["value"] if picker["enabled"] else None}
+
+    def _set_start_dates_session(
+        self,
+        course: str,
+        schedule: dict[int, datetime],
+        results: dict[int, dict],
+        headless: bool = True,
+        dry_run: bool = False,
+    ) -> None:
+        """Internal method to set grade item start dates in a single browser session.
+
+        Records each item's outcome in ``results`` and skips items already
+        recorded, so a re-authentication retry resumes where it stopped.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _load(page, url: str) -> None:
+            page.goto(url)
+            if "login" in page.url:
+                logger.error("Authentication session expired. Please re-authenticate.")
+                raise RuntimeError("Authentication session expired.")
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                logger.debug(f"Network never went idle on {url}; continuing")
+
+        def _do_set_start_dates():
+            def _guard(route):
+                request = route.request
+                if manage_grades.is_restrictions_write(request.method, request.url):
+                    route.continue_()
+                else:
+                    logger.debug(f"Blocked request: {request.method} {request.url}")
+                    route.abort()
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                # Only Restrictions-tab saves may write; Enter Grades is always blocked.
+                context.route("**/*", _guard)
+                try:
+                    for object_id, start in schedule.items():
+                        if object_id in results:
+                            continue
+                        url = manage_grades.edit_tab_urls(self.base_url, course, "item", object_id)["restrictions"]
+                        target = start.strftime("%Y-%m-%dT%H:%M:00.000")
+                        record = {"url": url, "target": target}
+                        page = context.new_page()
+                        try:
+                            _load(page, url)
+                            # Title is "Edit Item: <name> - <course> - NYU"; names may contain " - ".
+                            record["name"] = page.title().rsplit(" - ", 2)[0].removeprefix("Edit Item: ")
+                            record["before"] = self._read_start_date(page)
+                            if record["before"] == {"enabled": True, "value": target}:
+                                record["status"] = "unchanged"
+                                logger.info(f"{record['name']}: start date already {target}")
+                                results[object_id] = record
+                                continue
+
+                            page.get_by_label("Has Start Date").check()
+                            hiddens = page.evaluate(manage_grades.SET_START_DATE_JS, target)
+                            expected = {
+                                "year": str(start.year), "month": str(start.month), "day": str(start.day),
+                                "hour": str(start.hour), "minute": str(start.minute), "isEnabled": "1",
+                            }
+                            if hiddens != expected:
+                                raise LookupError(f"Start date form did not update: {hiddens}")
+
+                            if dry_run:
+                                record["status"] = "dry run"
+                                logger.info(f"{record['name']}: would set start date {record['before']} -> {target}")
+                                results[object_id] = record
+                                continue
+
+                            page.get_by_role("button", name="Save", exact=True).click()
+                            page.wait_for_load_state("networkidle", timeout=30000)
+
+                            # Re-read from the server to confirm the save took.
+                            _load(page, url)
+                            record["after"] = self._read_start_date(page)
+                            if record["after"] != {"enabled": True, "value": target}:
+                                raise LookupError(f"Start date not saved; page shows {record['after']}")
+                            record["status"] = "updated"
+                            logger.info(f"{record['name']}: start date {record['before']['value']} -> {target}")
+                        except (PlaywrightError, LookupError) as e:
+                            logger.error(f"Failed to set start date for {object_id}: {e}")
+                            record["status"] = "failed"
+                            record["error"] = str(e)
+                        finally:
+                            if not page.is_closed():
+                                page.close()
+                        results[object_id] = record
+                finally:
+                    browser.close()
+
+        _run_sync_in_thread(_do_set_start_dates)
+
+    def set_start_dates(
+        self,
+        course: str,
+        schedule: dict[int, datetime],
+        headless: bool = True,
+        dry_run: bool = False,
+    ) -> dict[int, dict]:
+        """Set the Restrictions-tab start date of each grade item and save.
+
+        Turns on "Has Start Date" and sets it to the given local date and time,
+        then reloads the tab to confirm the saved value. A failure on one item
+        is recorded and the remaining items are still processed.
+
+        Args:
+          * course: The course org unit ID (``ou``)
+          * schedule: Start date and time by grade item ID (``objectId``)
+          * headless: Whether to run the browser in headless mode
+          * dry_run: Fill in the form for each item without saving
+
+        Returns:
+            dict[int, dict]: Per item: name, url, target, before, after, status
+            ("updated", "unchanged", "dry run" or "failed") and any error.
+        """
+        results: dict[int, dict] = {}
+        self._run_with_reauth(
+            lambda: self._set_start_dates_session(course, schedule, results, headless, dry_run),
+            headless=headless,
+        )
+        return results

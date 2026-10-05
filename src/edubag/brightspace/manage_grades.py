@@ -5,6 +5,7 @@ The crawl visits the Manage Grades list and each grade object's edit tabs
 links: switching tabs in the UI POSTs the whole edit form back to the server.
 """
 
+from datetime import date, datetime, time, timedelta
 from urllib.parse import urlparse
 
 # Edit-page tabs by grade object kind, in the order Brightspace shows them.
@@ -54,6 +55,40 @@ def is_read_only_request(method: str, url: str) -> bool:
     if method.upper() in ("GET", "HEAD"):
         return True
     return path.startswith(_ALLOWED_POST_PATHS)
+
+
+def is_restrictions_write(method: str, url: str) -> bool:
+    """Whether a request is a crawl-safe read or a save of a Restrictions tab.
+
+    Used when editing start dates: the only write allowed is posting a grade
+    item's Restrictions form. Enter Grades stays blocked.
+    """
+    if is_read_only_request(method, url):
+        return True
+    path = urlparse(url).path
+    return "/grades/admin/enter/" not in path and path.endswith(
+        f"/{MANAGE_PATH}{EDIT_TABS['item']['restrictions']}"
+    )
+
+
+def following_weekday(day: date, weekday: int = 4, at: time = time(12, 0)) -> datetime:
+    """The first ``weekday`` (Monday=0 ... Friday=4) strictly after ``day``, at ``at``."""
+    days_ahead = (weekday - day.weekday()) % 7 or 7
+    return datetime.combine(day + timedelta(days=days_ahead), at)
+
+
+# Tick "Has Start Date" first (a real click, so D2L's enabler runs), then set
+# the picker; its change event syncs the hidden year/month/day/... inputs that
+# the form submits. Returns those hidden values.
+SET_START_DATE_JS = r"""(value) => {
+  const box = document.querySelector(".js_startDateEdit");
+  const picker = box && box.querySelector("d2l-input-date-time");
+  if (!picker) throw new Error("Start date picker not found");
+  picker.value = value;
+  picker.dispatchEvent(new CustomEvent("change", { bubbles: true, composed: true }));
+  const part = (p) => (document.getElementById(`${picker.id}$${p}`) || {}).value;
+  return Object.fromEntries(["year", "month", "day", "hour", "minute", "isEnabled"].map((p) => [p, part(p)]));
+}"""
 
 
 # Rows of the Manage Grades table: id, kind, name, parent category, columns.

@@ -1,5 +1,7 @@
 """Tests for the Brightspace Manage Grades crawl helpers."""
 
+from datetime import date, datetime, time
+
 import pytest
 
 from edubag.brightspace import manage_grades
@@ -122,3 +124,32 @@ def test_extract_tab_panel(page):
     assert result["lists"] == [
         {"section": "Grading", "field": "Rubrics", "rows": [], "empty_text": "No rubrics selected."}
     ]
+
+
+@pytest.mark.parametrize(
+    "day, expected",
+    [
+        ("2026-09-03", "2026-09-04"),  # Thursday -> next day
+        ("2026-09-08", "2026-09-11"),  # Tuesday -> same week
+        ("2026-09-04", "2026-09-11"),  # Friday -> the following Friday
+        ("2026-12-10", "2026-12-11"),
+    ],
+)
+def test_following_weekday(day, expected):
+    assert manage_grades.following_weekday(date.fromisoformat(day)) == datetime.combine(
+        date.fromisoformat(expected), time(12, 0)
+    )
+
+
+@pytest.mark.parametrize(
+    "method, url, allowed",
+    [
+        ("POST", BASE + "d2l/lms/grades/admin/manage/item_rests_edit.d2l?objectId=1&ou=2", True),
+        ("POST", BASE + "d2l/lms/grades/admin/manage/item_props_newedit.d2l?objectId=1&ou=2", False),
+        ("POST", BASE + "d2l/lms/grades/admin/enter/grade_item_edit.d2l?objectId=1&ou=2", False),
+        ("GET", BASE + "d2l/lms/grades/admin/enter/user_list_view.d2l?ou=2", False),
+        ("GET", BASE + "d2l/lms/grades/admin/manage/item_rests_edit.d2l?objectId=1&ou=2", True),
+    ],
+)
+def test_is_restrictions_write(method, url, allowed):
+    assert manage_grades.is_restrictions_write(method, url) is allowed
