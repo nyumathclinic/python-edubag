@@ -700,6 +700,56 @@ def save_attendance(
         typer.echo(str(p))
 
 
+@client_app.command("clear-grades")
+def clear_grades(
+    course: Annotated[
+        str,
+        typer.Argument(help="Course ID (ou) or full Enter Grades URL for the grade item"),
+    ],
+    grade_items: Annotated[
+        list[str] | None,
+        typer.Argument(help="One or more grade item IDs (objectId); omit when passing a full URL"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Select all rows and find 'Clear Grades' without clicking it"),
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Clear all grades for one or more grade items and save.
+
+    Example:
+        python -m edubag brightspace client clear-grades 611388 1940969 1940935
+    """
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        failures = client.clear_grades(
+            course=course,
+            grade_items=grade_items or [],
+            headless=headless,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    if failures:
+        typer.echo(f"Failed to clear {len(failures)} grade item(s):", err=True)
+        for url, error in failures.items():
+            typer.echo(f"  {url}: {error}", err=True)
+        raise typer.Exit(code=1)
+
+
 # Register the brightspace app as a subcommand with the main app
 main_app.add_typer(app, name="brightspace")
 app.add_typer(client_app, name="client")

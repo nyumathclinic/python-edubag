@@ -114,6 +114,55 @@ class TestBrightspaceClient:
         found = BrightspaceClient._check_export_checkbox(page, name="PointsGrade", labels=("Points grade",))
         assert found is False
 
+    def test_grade_item_enter_urls_from_ids(self):
+        """Build one Enter Grades URL per grade item ID, in order."""
+        client = BrightspaceClient()
+        prefix = "https://brightspace.nyu.edu/d2l/lms/grades/admin/enter/grade_item_edit.d2l"
+        assert client._grade_item_enter_urls("611388", ["1940851", "1940852"]) == [
+            f"{prefix}?objectId=1940851&ou=611388",
+            f"{prefix}?objectId=1940852&ou=611388",
+        ]
+
+    def test_grade_item_enter_urls_single_string(self):
+        """A single ID passed as a string is not split into characters."""
+        urls = BrightspaceClient()._grade_item_enter_urls("611388", "1940851")
+        assert len(urls) == 1
+        assert urls[0].endswith("objectId=1940851&ou=611388")
+
+    def test_grade_item_enter_urls_passthrough(self):
+        """A full URL is used as-is."""
+        url = "https://brightspace.nyu.edu/d2l/lms/grades/admin/enter/grade_item_edit.d2l?objectId=1&ou=2"
+        assert BrightspaceClient()._grade_item_enter_urls(url) == [url]
+
+    def test_grade_item_enter_urls_validation(self):
+        """Reject missing grade item IDs or a URL combined with IDs."""
+        client = BrightspaceClient()
+        with pytest.raises(ValueError):
+            client._grade_item_enter_urls("611388")
+        with pytest.raises(ValueError):
+            client._grade_item_enter_urls("https://brightspace.nyu.edu/x", ["1940851"])
+
+    def test_clear_grades_skips_recorded_items(self, monkeypatch):
+        """A re-auth retry resumes after items already done or failed."""
+        client = BrightspaceClient(auth_state_path=Path(__file__))
+        calls: list[list[str]] = []
+
+        def fake_session(urls, done, failures, headless, dry_run):
+            pending = [u for u in urls if u not in done and u not in failures]
+            calls.append(pending)
+            if len(calls) == 1:
+                done.add(pending[0])
+                failures[pending[1]] = "boom"
+                raise RuntimeError("Authentication session expired.")
+            done.update(pending)
+
+        monkeypatch.setattr(client, "_clear_grades_session", fake_session)
+        monkeypatch.setattr(client, "authenticate", lambda headless: None)
+        failures = client.clear_grades("611388", ["1", "2", "3"])
+        assert [len(c) for c in calls] == [3, 1]
+        assert calls[1][0].endswith("objectId=3&ou=611388")
+        assert list(failures.values()) == ["boom"]
+
     def test_save_gradebook_integration_private(self):
         """Private integration test: download gradebook for a real course.
 

@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, Sequence, TypeVar
 
 import platformdirs
 from loguru import logger
@@ -179,7 +179,7 @@ class BrightspaceClient(LMSClient):
 
         raise PlaywrightTimeoutError("Timed out waiting for Brightspace post-login landing page")
 
-    def _run_with_reauth(self, operation: Callable[[], list[Path]], headless: bool) -> list[Path]:
+    def _run_with_reauth(self, operation: Callable[[], T], headless: bool) -> T:
         """Run an operation with one re-authentication retry on auth expiration."""
         if not self.auth_state_path.exists():
             logger.warning(
@@ -201,7 +201,7 @@ class BrightspaceClient(LMSClient):
                 logger.error(f"Max retries exceeded. RuntimeError: {e}")
                 raise
 
-        return []
+        raise AssertionError("unreachable")
 
     def authenticate(self, username: str | None = None, password: str | None = None, headless: bool = False) -> None:
         """Log into Brightspace and save the authentication state.
@@ -566,3 +566,196 @@ class BrightspaceClient(LMSClient):
             lambda: self._save_attendance_session(course, save_dir, headless),
             headless=headless,
         )
+
+    def _grade_item_enter_urls(self, course: str, grade_items: Sequence[str] = ()) -> list[str]:
+        """Build the "Enter Grades" URLs for one or more grade items.
+
+        ``course`` may be a full Enter Grades URL (in which case ``grade_items``
+        must be empty) or a course org unit ID used with ``grade_items``.
+        """
+        if isinstance(grade_items, str):
+            grade_items = [grade_items]
+        if course.startswith("http://") or course.startswith("https://"):
+            if grade_items:
+                raise ValueError("Pass either a full grade item URL or course and grade item IDs, not both.")
+            return [course]
+        if not grade_items:
+            raise ValueError("At least one grade item ID is required when course is not a full URL.")
+        return [
+            f"{self.base_url}d2l/lms/grades/admin/enter/grade_item_edit.d2l"
+            f"?objectId={grade_item}&ou={course}"
+            for grade_item in grade_items
+        ]
+
+    @staticmethod
+    def _confirm_dialog(page, title: str = "Confirmation", button: str = "Yes") -> None:
+        """Click a button in a legacy D2L dialog and wait for the dialog to close.
+
+        Legacy D2L dialogs can ignore Playwright's coordinate-based click
+        (e.g. if the dialog repositions while being scrolled into view), so
+        fall back to the button's own click() if the dialog stays open.
+        """
+        dialog = page.get_by_role("dialog", name=title)
+        dialog.wait_for(state="visible", timeout=10000)
+        target = dialog.get_by_role("button", name=button, exact=True)
+        target.click()
+        try:
+            dialog.wait_for(state="hidden", timeout=5000)
+        except PlaywrightTimeoutError:
+            logger.debug(f"{title!r} dialog still open after click; invoking {button!r} click() directly")
+            target.evaluate("el => el.click()")
+            dialog.wait_for(state="hidden", timeout=10000)
+
+    @staticmethod
+    def _show_max_results_per_page(page) -> int | None:
+        """Set the grid's "Results Per Page" select to its largest option.
+
+        Changing the select reloads the grid, so wait for the network to
+        settle afterwards. Returns the page size in effect, or None if the
+        page has no paging control (all rows already shown).
+        """
+        page_size = page.get_by_label("Results Per Page")
+        if page_size.count() == 0:
+            return None
+        page_size = page_size.first
+        values = page_size.locator("option").evaluate_all("opts => opts.map(o => o.value)")
+        largest = str(max(int(v) for v in values if v.isdigit()))
+        if page_size.input_value() != largest:
+            logger.info(f"Setting Results Per Page to {largest}")
+            page_size.select_option(largest)
+            page.wait_for_timeout(500)
+            page.wait_for_load_state("networkidle", timeout=30000)
+        return int(largest)
+
+    def _clear_grade_item(self, page, url: str, dry_run: bool = False) -> None:
+        """Clear and save all grades on an already-loaded Enter Grades page."""
+        page.wait_for_load_state("networkidle", timeout=30000)
+        heading = page.locator("h1").first
+        if heading.count() > 0:
+            logger.info(f"Clearing grades on {heading.inner_text().strip()!r}")
+
+        # "Select all rows" only selects rows on the current page, so
+        # show as many rows as the grid allows before selecting.
+        page_size = self._show_max_results_per_page(page)
+        checkbox_count = page.get_by_role("checkbox").count()
+        logger.info(f"Found {checkbox_count} checkboxes on the page (page size: {page_size})")
+        if page_size is not None and checkbox_count > page_size:
+            logger.warning(
+                f"At least {page_size} rows are shown; students on later pages "
+                "will not be cleared."
+            )
+
+        if not self._check_export_checkbox(
+            page,
+            labels=("Select all rows", "Select All Rows"),
+        ):
+            raise LookupError(f"'Select all rows' checkbox not found at {url}")
+
+        clear_button = page.get_by_role("button", name="Clear Grades")
+        clear_button.wait_for(state="visible", timeout=10000)
+
+        if dry_run:
+            logger.info("Dry run: found 'Clear Grades'; leaving page without changes.")
+            return
+
+        clear_button.click()
+        self._confirm_dialog(page)
+        page.wait_for_load_state("networkidle", timeout=30000)
+
+        save_button = page.get_by_role("button", name="Save and Close")
+        save_button.wait_for(state="visible", timeout=10000)
+        save_button.click()
+        try:
+            # Saving asks "You are about to save changes..." in a second dialog.
+            self._confirm_dialog(page)
+            page.wait_for_url(lambda u: "grade_item_edit.d2l" not in u, timeout=30000)
+        except PlaywrightTimeoutError:
+            # Log only page chrome (URL and button labels), never grid contents.
+            logger.error(f"Still on {page.url} after 'Save and Close'.")
+            for frame in page.frames:
+                labels = [
+                    b.inner_text().strip()
+                    for b in frame.get_by_role("button").all()
+                    if b.is_visible()
+                ]
+                logger.error(f"Visible buttons in frame {frame.url}: {labels}")
+            raise
+        logger.info("Grades cleared and saved.")
+
+    def _clear_grades_session(
+        self,
+        urls: list[str],
+        done: set[str],
+        failures: dict[str, str],
+        headless: bool = True,
+        dry_run: bool = False,
+    ) -> None:
+        """Internal method to clear several grade items in a single browser session.
+
+        Records each URL in ``done`` or ``failures`` and skips URLs already
+        recorded, so a re-authentication retry resumes where it stopped.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do_clear_grades():
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                for url in urls:
+                    if url in done or url in failures:
+                        continue
+                    # A fresh page per item, so a failure (e.g. a dialog left
+                    # open) can't block navigation to the next item.
+                    page = context.new_page()
+                    try:
+                        page.goto(url)
+
+                        # Check if we need to re-login
+                        if "login" in page.url:
+                            logger.error("Authentication session expired. Please re-authenticate.")
+                            browser.close()
+                            raise RuntimeError("Authentication session expired.")
+
+                        self._clear_grade_item(page, url, dry_run)
+                        done.add(url)
+                    except (PlaywrightError, LookupError) as e:
+                        logger.error(f"Failed to clear grades at {url}: {e}")
+                        failures[url] = str(e)
+                    finally:
+                        if not page.is_closed():
+                            page.close()
+
+                browser.close()
+
+        _run_sync_in_thread(_do_clear_grades)
+
+    def clear_grades(
+        self,
+        course: str,
+        grade_items: Sequence[str] = (),
+        headless: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, str]:
+        """Clear every student's grade for one or more grade items and save.
+
+        Items are processed in order in one browser session; a failure on one
+        item is logged and the remaining items are still processed.
+
+        Args:
+          * course: The course org unit ID (``ou``), or the full "Enter Grades" URL
+          * grade_items: Grade item IDs (``objectId``); omit when ``course`` is a URL
+          * headless: Whether to run the browser in headless mode
+          * dry_run: Select rows and locate "Clear Grades" without clicking it
+
+        Returns:
+            dict[str, str]: Error message by Enter Grades URL for each item that
+            failed; empty if every item succeeded.
+        """
+        urls = self._grade_item_enter_urls(course, grade_items)
+        done: set[str] = set()
+        failures: dict[str, str] = {}
+        self._run_with_reauth(
+            lambda: self._clear_grades_session(urls, done, failures, headless, dry_run),
+            headless=headless,
+        )
+        return failures
