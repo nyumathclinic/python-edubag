@@ -103,6 +103,45 @@ def albert_xls_roster_to_gradescope_csv_roster(
     merged_roster.to_csv(output_path)
 
 
+@app.command("html2json")
+def html2json(
+    paths: Annotated[list[Path], typer.Argument(help="One or more saved Albert roster pages (HTML)")],
+    output: Annotated[Path, typer.Option(help="Directory for <pathstem>.json and its photos folder")],
+):
+    """Parse saved Albert roster pages into JSON, copying each student's photo."""
+    output.mkdir(parents=True, exist_ok=True)
+    for p in paths:
+        roster = AlbertRoster.from_html(p)
+        missing = int(roster.students["photo"].isna().sum())
+        target = roster.to_json(output / f"{roster.pathstem}.json")
+        typer.echo(f"{target}: {len(roster.students)} students ({missing} without photo)")
+
+
+@app.command("roster2vcf")
+def roster2vcf(
+    path: Annotated[Path, typer.Argument(help="Roster JSON written by html2json")],
+    output: Annotated[Path | None, typer.Option(help="Output .vcf (default: next to the JSON)")] = None,
+):
+    """Write a section's students as vCards (with photos) in one .vcf file."""
+    from .exports import write_vcards
+
+    target = write_vcards(AlbertRoster.from_json(path), output or path.with_suffix(".vcf"))
+    typer.echo(str(target))
+
+
+@app.command("roster2anki")
+def roster2anki(
+    path: Annotated[Path, typer.Argument(help="Roster JSON written by html2json")],
+    output: Annotated[Path | None, typer.Option(help="Output .apkg (default: next to the JSON)")] = None,
+    deck_name: Annotated[str | None, typer.Option(help="Anki deck name (default: Roster::<section>)")] = None,
+):
+    """Write a section's photo → name flashcards as an Anki .apkg deck."""
+    from .exports import write_anki_deck
+
+    target = write_anki_deck(AlbertRoster.from_json(path), output or path.with_suffix(".apkg"), deck_name)
+    typer.echo(str(target))
+
+
 # Nested Typer app for web client automation
 client_app = typer.Typer(help="Automate Albert web client interactions")
 
@@ -140,6 +179,10 @@ def fetch_rosters(
     save_dir: Annotated[
         Path | None, typer.Option(help="Directory to save roster files")
     ] = None,
+    fmt: Annotated[
+        str,
+        typer.Option("--format", help="Roster format: excel, html (page plus photos), or both"),
+    ] = "excel",
     headless: Annotated[
         bool,
         typer.Option(
@@ -161,6 +204,7 @@ def fetch_rosters(
         term=term,
         save_dir=save_dir,
         headless=headless,
+        fmt=fmt,
     )
     for p in paths:
         typer.echo(str(p))
@@ -209,6 +253,10 @@ def fetch_roster(
     save_dir: Annotated[
         Path | None, typer.Option(help="Directory to save the roster file")
     ] = None,
+    fmt: Annotated[
+        str,
+        typer.Option("--format", help="Roster format: excel, html (page plus photos), or both"),
+    ] = "excel",
     headless: Annotated[
         bool,
         typer.Option(
@@ -226,14 +274,16 @@ def fetch_roster(
     """Fetch a class roster using its class number, term, and instructor ID."""
     client = AlbertClient(base_url=base_url, auth_state_path=auth_state_path)
     try:
-        path = client.fetch_roster(
+        paths = client.fetch_roster(
             class_number=class_number,
             term=term,
             instructor_id=instructor_id,
             save_dir=save_dir,
             headless=headless,
+            fmt=fmt,
         )
-        typer.echo(str(path))
+        for path in paths:
+            typer.echo(str(path))
     except Exception as e:
         typer.echo(f"Error fetching roster: {e}", err=True)
         raise typer.Exit(code=1) from e

@@ -5,30 +5,27 @@ import os
 import re
 from collections.abc import Generator
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import platformdirs
+from bs4 import BeautifulSoup
 from loguru import logger
 from playwright.sync_api import Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from edubag.albert.details import normalize_label, parse_detail_field
+from edubag.albert.roster import (
+    HTML_FIELD_ID,
+    HTML_PHOTO_FIELD,
+    AlbertRoster,
+    add_roster_keys,
+    parse_course_details,
+)
 from edubag.albert.term import Term
 from edubag.clients import LMSClient
 
-
-def _normalize_label(label: str) -> str:
-    """Convert a label to snake_case variable name format.
-
-    Args:
-        label: The label text to normalize.
-
-    Returns:
-        A snake_case version of the label.
-    """
-    # Convert to lowercase and replace non-word characters with underscores
-    # Strip leading/trailing underscores
-    normalized = re.sub(r"[^\w]+", "_", label.lower()).strip("_")
-    return normalized
+# Kept under its old name for existing callers.
+_normalize_label = normalize_label
 
 
 class AlbertClient(LMSClient):
@@ -207,23 +204,79 @@ class AlbertClient(LMSClient):
             else:
                 break
 
-    def _save_roster_for_course(self, course: Locator, save_path: Path | None = None) -> Path:
+    def _save_roster_for_course(
+        self, course: Locator, save_path: Path | None = None, fmt: str = "excel"
+    ) -> list[Path]:
         """Process a course and save its roster.
 
         Args:
             course: A course locator element.
             save_path: Directory to save the roster. If None, saves to current directory.
+            fmt: "excel", "html" (page plus photos), or "both".
 
         Returns:
-            Path to the saved roster file.
+            Paths to the saved roster file(s).
         """
         with course.page.expect_popup() as popup_info:
             course.get_by_role("link", name="Class Roster").click()
         roster_page = popup_info.value
         roster_page.wait_for_url(re.compile(r".*PortalActualURL=.*"))
-        download_file_path = self._save_roster_page(roster_page, save_path)
+        paths = self._save_roster_formats(roster_page, save_path, fmt)
         roster_page.close()
-        return download_file_path
+        return paths
+
+    def _save_roster_formats(self, roster_page: Page, save_path: Path | None, fmt: str) -> list[Path]:
+        """Save an open roster page as Excel, HTML (with photos), or both."""
+        if fmt not in ("excel", "html", "both"):
+            raise ValueError(f"Unknown roster format {fmt!r}; use 'excel', 'html' or 'both'")
+        paths = []
+        # Save the HTML first: generating the Excel download posts back to the page.
+        if fmt in ("html", "both"):
+            paths.append(self._save_html_roster_page(roster_page, save_path))
+        if fmt in ("excel", "both"):
+            paths.append(self._save_roster_page(roster_page, save_path))
+        return paths
+
+    def _save_html_roster_page(self, roster_page: Page, save_path: Path | None = None) -> Path:
+        """Save an open roster page's HTML and student photos for offline parsing.
+
+        Writes ``<pathstem>.html`` and ``<pathstem>_files/<row>.jpg``, with each
+        student photo's ``src`` rewritten to the local copy. Photos are fetched
+        through the browser context, so they use the logged-in session.
+        """
+        soup = BeautifulSoup(roster_page.content(), "lxml")
+        # Name the files from the live header, which fetch_course_details
+        # reads reliably, falling back to whatever the saved HTML yields.
+        course = parse_course_details(soup)
+        header = roster_page.locator("#win0divROSTER_HDRGRP")
+        if header.count() > 0:
+            course.update(self._extract_class_details_from_container(header))
+        stem = AlbertRoster.from_course(add_roster_keys(course)).pathstem
+        save_dir = save_path if save_path is not None else Path(".")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        files_dir = save_dir / f"{stem}_files"
+
+        photos = [
+            img
+            for img in soup.find_all("img", id=HTML_FIELD_ID)
+            if HTML_FIELD_ID.match(img["id"]).group(1) == HTML_PHOTO_FIELD and img.get("src")
+        ]
+        logger.info(f"Saving HTML roster {stem} with {len(photos)} photos")
+        for img in photos:
+            row = HTML_FIELD_ID.match(img["id"]).group(2)
+            response = roster_page.context.request.get(urljoin(roster_page.url, img["src"]))
+            if not response.ok:
+                logger.warning(f"Could not download photo for row {row}: HTTP {response.status}")
+                continue
+            files_dir.mkdir(exist_ok=True)
+            photo = files_dir / f"{row}.jpg"
+            photo.write_bytes(response.body())
+            img["src"] = f"{files_dir.name}/{photo.name}"
+
+        html_path = save_dir / f"{stem}.html"
+        html_path.write_text(str(soup), encoding="utf-8")
+        logger.info(f"Saved HTML roster to {html_path}")
+        return html_path
 
     def _save_roster_page(self, roster_page: Page, save_path: Path | None = None) -> Path:
         """Download a roster from an already-open Albert roster page."""
@@ -254,121 +307,24 @@ class AlbertClient(LMSClient):
             Dictionary with extracted class detail information.
         """
         class_details = {}
-        elements = container.locator(".psc_has_value").all()
-
-        for element in elements:
-            # Find the label within this element
+        for element in container.locator(".psc_has_value").all():
             label_element = element.locator(".ps-label")
             if label_element.count() == 0:
                 continue
-
             label_text = label_element.first.text_content()
-            if label_text:
-                label_text = label_text.strip()
+            label_parent = label_element.first.locator("xpath=parent::*")
+            label_parent_id = label_parent.first.get_attribute("id") if label_parent.count() > 0 else None
 
-            # If label is empty or just whitespace (like &nbsp;), extract from label element's parent ID
-            if not label_text or label_text == "\xa0":  # \xa0 is non-breaking space
-                label_parent = label_element.first.locator("xpath=parent::*")
-                if label_parent.count() > 0:
-                    label_parent_id = label_parent.first.get_attribute("id")
-                    if label_parent_id:
-                        match = re.search(r"win0div([A-Z0-9_]+)lbl", label_parent_id)
-                        if match:
-                            label_text = match.group(1)
-                        else:
-                            continue
-                    else:
-                        continue
-                else:
-                    continue
-
-            if not label_text:
-                continue
-
-            # Find the value within this element - try ps_box-value first
-            value_element = element.locator(".ps_box-value")
+            # Find the value, trying ps_box-value first, then other variations.
             value_text = None
+            for selector in [".ps_box-value", ".ps_box-value-readonly", "[id*='$span']"]:
+                value_element = element.locator(selector)
+                if value_element.count() > 0:
+                    value_text = value_element.first.text_content()
+                    if value_text is not None:
+                        break
 
-            if value_element.count() > 0:
-                value_text = value_element.first.text_content()
-                if value_text is not None:
-                    value_text = value_text.strip()
-
-            # If no ps_box-value found or it's None, try ps_box-value-readonly or other variations
-            if value_text is None:
-                # Try alternative class names
-                for class_name in [".ps_box-value-readonly", "[id*='$span']"]:
-                    value_element = element.locator(class_name)
-                    if value_element.count() > 0:
-                        value_text = value_element.first.text_content()
-                        if value_text is not None:
-                            value_text = value_text.strip()
-                            break
-
-            # If we still don't have a value, skip this element
-            if value_text is None:
-                continue
-
-            # Clean up the value text: replace non-breaking spaces with regular spaces and collapse multiple spaces
-            if value_text:
-                value_text = value_text.replace("\xa0", " ")
-                value_text = re.sub(r" +", " ", value_text)
-                value_text = value_text.strip()
-
-            # Skip elements with empty or whitespace-only values
-            if not value_text:
-                continue
-
-            # Normalize the label to snake_case
-            normalized_label = _normalize_label(label_text)
-            # map funny labels to more standard ones
-            label_mappings = {
-                "derived_clsrch_descr200": "full_course_name",
-                "derived_clsrch_descrlong": "description",
-                "ssr_cls_dtl_wrk_ssr_cls_txb_msg": "textbook_message",
-            }
-            if normalized_label in label_mappings:
-                normalized_label = label_mappings[normalized_label]
-
-            # Try to convert to integer if the value is a clean integer string.
-            # Values like '123ABC' or '12.5' will be kept as strings.
-            # Values starting with '0' (except exactly '0') are kept as strings to preserve leading zeros.
-            # This is intentional to preserve data as-is unless clearly numeric.
-            # Empty strings are kept as-is.
-            if value_text:
-                # Keep strings with leading zeros (except exactly "0") as strings
-                if value_text.startswith("0") and len(value_text) > 1:
-                    value = value_text
-                else:
-                    try:
-                        value = int(value_text)
-                    except ValueError:
-                        value = value_text
-            else:
-                value = value_text
-
-            class_details[normalized_label] = value
-
-            # Special parsing for derived_ssr_fc_descr254: "Course Name (class_number) (class_type)"
-            if normalized_label == "derived_ssr_fc_descr254" and isinstance(value, str):
-                # Match pattern: text (text) (text)
-                match = re.match(r"^(.+?)\s*\(([^)]+)\)\s*\(([^)]+)\)$", value)
-                if match:
-                    course_name = match.group(1).strip()
-                    # class_number = match.group(2).strip()  # Already have this
-                    class_type = match.group(3).strip()
-                    class_details["course_name"] = course_name
-                    class_details["class_type"] = class_type
-                    del class_details[normalized_label]
-
-            # Special parsing for derived_clsrch_sss_page_keydescr: "School | Term | Type"
-            if normalized_label == "derived_clsrch_sss_page_keydescr" and isinstance(value, str):
-                # Extract the school (part before the first |)
-                parts = value.split("|")
-                if parts:
-                    school = parts[0].strip()
-                    class_details["school"] = school
-                del class_details[normalized_label]
+            class_details.update(parse_detail_field(label_text, label_parent_id, value_text))
 
         return class_details
 
@@ -462,7 +418,8 @@ class AlbertClient(LMSClient):
         instructor_id: int | str | None = None,
         save_dir: Path | None = None,
         headless: bool = True,
-    ) -> Path:
+        fmt: str = "excel",
+    ) -> list[Path]:
         """Fetch and save a roster from a direct Albert course URL."""
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
@@ -475,7 +432,7 @@ class AlbertClient(LMSClient):
             page.wait_for_load_state("networkidle")
             page.goto(self._course_url(self.course_base_url, class_number, term, instructor_id))
             page.wait_for_load_state("networkidle")
-            result = self._save_roster_page(page, save_dir)
+            result = self._save_roster_formats(page, save_dir, fmt)
             browser.close()
             return result
 
@@ -488,7 +445,8 @@ class AlbertClient(LMSClient):
         username: str | None = None,
         password: str | None = None,
         headless: bool = True,
-    ) -> Path:
+        fmt: str = "excel",
+    ) -> list[Path]:
         """Fetch and save a class roster using Albert's direct course URL.
 
         Args:
@@ -499,6 +457,10 @@ class AlbertClient(LMSClient):
             username: NetID used if authentication is required.
             password: Password used if authentication is required.
             headless: Whether to run the browser headlessly.
+            fmt: "excel", "html" (page plus photos), or "both".
+
+        Returns:
+            Paths to the saved roster file(s).
         """
         if not self.auth_state_path.exists():
             self.authenticate(username=username, password=password, headless=headless)
@@ -506,7 +468,7 @@ class AlbertClient(LMSClient):
         for attempt in range(2):
             try:
                 return self._fetch_direct_roster_session(
-                    class_number, term, instructor_id, save_dir, headless
+                    class_number, term, instructor_id, save_dir, headless, fmt
                 )
             except (TimeoutError, PlaywrightTimeoutError, RuntimeError):
                 if attempt == 1:
@@ -577,6 +539,7 @@ class AlbertClient(LMSClient):
         term: str | Term,
         save_dir: Path | None = None,
         headless: bool = True,
+        fmt: str = "excel",
     ) -> list[Path]:
         """Internal method to fetch rosters in a single browser session.
 
@@ -621,8 +584,7 @@ class AlbertClient(LMSClient):
 
             # Process all courses across all pages
             for course in self._get_courses_paginated(page, course_name):
-                download_path = self._save_roster_for_course(course, save_dir)
-                result_paths.append(download_path)
+                result_paths.extend(self._save_roster_for_course(course, save_dir, fmt))
 
             browser.close()
         return result_paths
@@ -635,6 +597,7 @@ class AlbertClient(LMSClient):
         username: str | None = None,
         password: str | None = None,
         headless: bool = True,
+        fmt: str = "excel",
     ) -> list[Path]:
         """Fetch from the network and save to disk the class rosters for a given
         course offering.
@@ -647,6 +610,7 @@ class AlbertClient(LMSClient):
           * username (str | None): NetID to log in with. If None, user must enter manually.
           * password (str | None): Password for login. If None, user must enter manually.
           * headless (bool): Whether to run the browser in headless mode.
+          * fmt (str): "excel", "html" (page plus photos), or "both".
 
         Returns:
             List[Path]: List of paths to the downloaded roster files.
@@ -659,7 +623,7 @@ class AlbertClient(LMSClient):
         max_retries = 1
         for attempt in range(max_retries + 1):
             try:
-                return self._fetch_rosters_session(course_name, term, save_dir, headless)
+                return self._fetch_rosters_session(course_name, term, save_dir, headless, fmt)
             except (TimeoutError, RuntimeError) as e:
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")

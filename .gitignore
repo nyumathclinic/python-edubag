@@ -209,3 +209,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 tests/debug_mark_engaged.py
+
+# Downloaded class rosters and photos (FERPA-protected)
+rosters/
