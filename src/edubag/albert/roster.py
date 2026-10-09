@@ -28,6 +28,11 @@ HTML_STUDENT_FIELDS = {
     "NYU_NMCOACH_WRK_DESCR50": "study_away",
 }
 HTML_PHOTO_FIELD = "NYU_EMP_SPIC_VW_EMPLOYEE_PHOTO"
+# The roster page links ~60x87 px thumbnails from Albert's image cache, e.g.
+# /cs/csprod/cache/861/NYU_EMP_SPIC_VW_<id>_2000000000.JPG; the same <id> under
+# EMPL_PHOTO_ is the larger (~128x188 px) photo shown in Albert's large-photo view.
+SMALL_PHOTO_PREFIX = "/NYU_EMP_SPIC_VW_"
+LARGE_PHOTO_PREFIX = "/EMPL_PHOTO_"
 HTML_STUDENT_BOX = re.compile(r"^win0divBIGGRP\$(\d+)$")
 HTML_FIELD_ID = re.compile(r"^([A-Z][A-Z0-9_]*)(?:\$\d+\$)?\$(\d+)$")
 # A course code such as "MATH-UA 122" anywhere in the course details.
@@ -38,6 +43,13 @@ STUDENT_COLUMNS = [
     "career", "program", "plan", "level", "study_away", "drop_reason",
     "phone", "photo",
 ]
+
+
+def large_photo_src(src: str) -> str | None:
+    """URL of the larger version of a roster thumbnail, or None if not a thumbnail URL."""
+    if SMALL_PHOTO_PREFIX not in src:
+        return None
+    return src.replace(SMALL_PHOTO_PREFIX, LARGE_PHOTO_PREFIX, 1)
 
 
 def unpack_progplan(progplan: str) -> tuple[str, str]:

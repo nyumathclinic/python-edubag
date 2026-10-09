@@ -98,8 +98,11 @@ def anki_model() -> genanki.Model:
                 '<div class="detail">{{Program}}</div><div class="detail">{{Section}}</div>',
             }
         ],
+        # Albert's roster photos are ~60x87 px thumbnails; scale them up to a
+        # fixed share of the screen (max-height alone would never enlarge them).
         css=".card { font-family: sans-serif; text-align: center; }"
-        " .card img { max-height: 60vh; } .name { font-size: 1.6em; } .detail { color: #666; }",
+        " .card img { height: 50vh; width: auto; max-width: 90vw; object-fit: contain; }"
+        " .name { font-size: 1.6em; } .detail { color: #666; }",
         sort_field_index=2,
     )
 

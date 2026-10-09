@@ -13,9 +13,10 @@ import vobject
 
 from edubag.albert.client import AlbertClient
 from edubag.albert.exports import course_label, write_anki_deck, write_vcards
-from edubag.albert.roster import AlbertRoster, unpack_progplan
+from edubag.albert.roster import AlbertRoster, large_photo_src, unpack_progplan
 
 FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"synthetic photo" + b"\xff\xd9"
+FAKE_LARGE_JPEG = b"\xff\xd8\xff\xe0" + b"synthetic large photo" + b"\xff\xd9"
 
 STUDENTS = [
     # (row, name, campus id, netid, program and plan, level, photo src or None)
@@ -182,18 +183,22 @@ def test_write_anki_deck(roster_html, tmp_path):
 class _FakeResponse:
     def __init__(self, body, ok=True):
         self._body, self.ok, self.status = body, ok, 200 if ok else 404
+        self.headers = {"content-type": "image/jpeg" if ok else "text/html; charset=utf-8"}
 
     def body(self):
         return self._body
 
 
 class _FakeRequest:
-    def __init__(self):
+    def __init__(self, missing=()):
         self.urls = []
+        self.missing = set(missing)
 
     def get(self, url):
         self.urls.append(url)
-        return _FakeResponse(FAKE_JPEG)
+        if url in self.missing:
+            return _FakeResponse(b"<html>Not Found</html>", ok=False)
+        return _FakeResponse(FAKE_LARGE_JPEG if "/EMPL_PHOTO_" in url else FAKE_JPEG)
 
 
 class _FakeContext:
@@ -223,18 +228,36 @@ class _FakeLocator:
         return 0
 
 
+def test_large_photo_src():
+    assert (
+        large_photo_src("/cs/csprod/cache/861/NYU_EMP_SPIC_VW_GE1TMNBUGUZDS=_2000000000.JPG")
+        == "/cs/csprod/cache/861/EMPL_PHOTO_GE1TMNBUGUZDS=_2000000000.JPG"
+    )
+    assert large_photo_src("files/0.jpg") is None
+
+
 def test_save_html_roster_page_downloads_photos(tmp_path):
+    base = "https://sis.nyu.edu/cs/csprod/cache/861/"
     server_srcs = [
         "/cs/csprod/cache/861/NYU_EMP_SPIC_VW_AAAA=_2000000000.JPG",
         "/cs/csprod/cache/861/NYU_EMP_SPIC_VW_BBBB=_2000000000.JPG",
     ]
     page = _FakePage(roster_page_html(server_srcs))
+    # The second student has no large photo (Albert's placeholder), so it 404s.
+    page.context.request.missing = {f"{base}EMPL_PHOTO_BBBB=_2000000000.JPG"}
     path = AlbertClient()._save_html_roster_page(page, tmp_path)
 
     assert path == tmp_path / "class10488_016_1268.html"
-    # Only student photos are fetched (not the name-recording icon), via the page's session.
-    assert page.context.request.urls == [f"https://sis.nyu.edu{src}" for src in server_srcs]
-    assert (tmp_path / "class10488_016_1268_files" / "0.jpg").read_bytes() == FAKE_JPEG
+    # Only student photos are fetched (not the name-recording icon), via the page's
+    # session: the large photo first, the thumbnail only when that fails.
+    assert page.context.request.urls == [
+        f"{base}EMPL_PHOTO_AAAA=_2000000000.JPG",
+        f"{base}EMPL_PHOTO_BBBB=_2000000000.JPG",
+        f"{base}NYU_EMP_SPIC_VW_BBBB=_2000000000.JPG",
+    ]
+    files = tmp_path / "class10488_016_1268_files"
+    assert (files / "0.jpg").read_bytes() == FAKE_LARGE_JPEG
+    assert (files / "1.jpg").read_bytes() == FAKE_JPEG
 
     roster = AlbertRoster.from_html(path)
     assert roster.photo_path(roster.students.iloc[1]["photo"]).read_bytes() == FAKE_JPEG

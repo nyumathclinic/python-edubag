@@ -19,6 +19,7 @@ from edubag.albert.roster import (
     HTML_PHOTO_FIELD,
     AlbertRoster,
     add_roster_keys,
+    large_photo_src,
     parse_course_details,
 )
 from edubag.albert.term import Term
@@ -262,9 +263,21 @@ class AlbertClient(LMSClient):
             if HTML_FIELD_ID.match(img["id"]).group(1) == HTML_PHOTO_FIELD and img.get("src")
         ]
         logger.info(f"Saving HTML roster {stem} with {len(photos)} photos")
+        n_large = 0
         for img in photos:
             row = HTML_FIELD_ID.match(img["id"]).group(2)
-            response = roster_page.context.request.get(urljoin(roster_page.url, img["src"]))
+            # Prefer the larger photo; students without one (only Albert's
+            # placeholder silhouette) get a 404 there, so fall back to the thumbnail.
+            response = None
+            if large := large_photo_src(img["src"]):
+                candidate = roster_page.context.request.get(urljoin(roster_page.url, large))
+                if candidate.ok and candidate.headers.get("content-type", "").startswith("image/"):
+                    response = candidate
+                    n_large += 1
+                else:
+                    logger.debug(f"No large photo for row {row} (HTTP {candidate.status}); using thumbnail")
+            if response is None:
+                response = roster_page.context.request.get(urljoin(roster_page.url, img["src"]))
             if not response.ok:
                 logger.warning(f"Could not download photo for row {row}: HTTP {response.status}")
                 continue
@@ -272,6 +285,7 @@ class AlbertClient(LMSClient):
             photo = files_dir / f"{row}.jpg"
             photo.write_bytes(response.body())
             img["src"] = f"{files_dir.name}/{photo.name}"
+        logger.info(f"Saved {n_large} large photos and {len(photos) - n_large} thumbnails")
 
         html_path = save_dir / f"{stem}.html"
         html_path.write_text(str(soup), encoding="utf-8")
