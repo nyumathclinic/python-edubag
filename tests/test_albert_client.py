@@ -136,6 +136,17 @@ class TestAlbertClientDirectCourseUrl:
         else:
             raise AssertionError("Expected missing instructor ID to raise ValueError")
 
+    def test_engagement_url_uses_class_keys(self):
+        url = AlbertClient._engagement_url(class_number=10488, term="Fall 2026", instructor_id="instructor")
+
+        assert url.startswith(AlbertClient.engagement_base_url + "?")
+        assert parse_qs(urlparse(url).query) == {
+            "INSTRUCTOR_ID": ["instructor"],
+            "INSTITUTION": ["NYUNV"],
+            "CLASS_NBR": ["10488"],
+            "STRM": ["1268"],
+        }
+
     def test_direct_fetch_methods_exist(self):
         assert callable(AlbertClient.fetch_roster)
         assert callable(AlbertClient.fetch_course_details)

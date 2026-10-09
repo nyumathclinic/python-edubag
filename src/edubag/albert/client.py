@@ -46,6 +46,11 @@ class AlbertClient(LMSClient):
         "https://sis.nyu.edu/psc/csprod/EMPLOYEE/SA/c/"
         "NYU_SR_FL.NYU_CLASSROSTER_FL.GBL"
     )
+    # The Academic Engagement roster, which the dashboard opens in a lightbox.
+    engagement_base_url = (
+        "https://sis.nyu.edu/psc/csprod/EMPLOYEE/SA/c/"
+        "SA_LEARNING_MANAGEMENT.NYU_AE_ROSTER_FL.GBL"
+    )
 
     @staticmethod
     def _default_auth_state_path() -> Path:
@@ -64,13 +69,12 @@ class AlbertClient(LMSClient):
             self.auth_state_path = self._default_auth_state_path()
 
     @staticmethod
-    def _course_url(
-        course_base_url: str,
+    def _class_keys(
         class_number: int | str,
         term: int | str | Term,
         instructor_id: int | str | None = None,
-    ) -> str:
-        """Build the Albert class roster URL for a course."""
+    ) -> dict:
+        """Query keys that identify an instructor's class on Albert pages."""
         if isinstance(term, Term):
             term_code = term.code
         elif isinstance(term, int) or term.isdigit():
@@ -86,18 +90,79 @@ class AlbertClient(LMSClient):
                 "instructor_id must be provided or ALBERT_INSTRUCTOR_ID must be set"
             )
 
+        return {
+            "INSTRUCTOR_ID": resolved_instructor_id,
+            "INSTITUTION": "NYUNV",
+            "CLASS_NBR": class_number,
+            "STRM": term_code,
+        }
+
+    @staticmethod
+    def _course_url(
+        course_base_url: str,
+        class_number: int | str,
+        term: int | str | Term,
+        instructor_id: int | str | None = None,
+    ) -> str:
+        """Build the Albert class roster URL for a course."""
         query = urlencode(
             {
                 "Page": "NYU_FACCLSRST_NUFL",
                 "Action": "U",
                 "ExactKeys": "Y",
-                "INSTRUCTOR_ID": resolved_instructor_id,
-                "INSTITUTION": "NYUNV",
-                "CLASS_NBR": class_number,
-                "STRM": term_code,
+                **AlbertClient._class_keys(class_number, term, instructor_id),
             }
         )
         return f"{course_base_url}?{query}"
+
+    @classmethod
+    def _engagement_url(
+        cls,
+        class_number: int | str,
+        term: int | str | Term,
+        instructor_id: int | str | None = None,
+    ) -> str:
+        """Build the Albert Academic Engagement URL for a course."""
+        query = urlencode(AlbertClient._class_keys(class_number, term, instructor_id))
+        return f"{cls.engagement_base_url}?{query}"
+
+    def _cache_large_photos(
+        self,
+        page: Page,
+        class_number: int | str,
+        term: int | str | Term,
+        instructor_id: int | str | None = None,
+    ) -> int:
+        """Show every student on the Academic Engagement page to cache their large photos.
+
+        Albert only writes a student's ``EMPL_PHOTO_`` image (see
+        :func:`large_photo_src`) to its cache once a page displays it, and the
+        class roster shows only thumbnails. The Academic Engagement page shows
+        the large photos, but by default only of students not yet marked
+        engaged, so select "All" first. Nothing is submitted.
+
+        Returns:
+            The number of large photos the page displayed.
+        """
+        page.goto(self._engagement_url(class_number, term, instructor_id))
+        page.wait_for_load_state("networkidle")
+        # Changing the filter posts back and redraws the grid; wait for that
+        # response, or the count (and the caching) can catch the old grid.
+        with page.expect_response(
+            lambda r: r.request.method == "POST" and "NYU_AE_ROSTER_FL" in r.url, timeout=30000
+        ):
+            page.locator("#NYU_AE_RSTR_WRK_NYU_ENGAGED").select_option("A")
+        page.wait_for_load_state("networkidle")
+        # The grid is redrawn client-side after the response; wait until it settles.
+        photos = page.locator("img[id^='LARGE_PHOTO']")
+        count = -1
+        for _ in range(20):
+            page.wait_for_timeout(500)
+            previous, count = count, photos.count()
+            if count == previous:
+                break
+        logger.info(f"Academic Engagement page showed {count} large photos for class {class_number}")
+        return count
 
     def authenticate(self, username: str | None = None, password: str | None = None, headless=False) -> None:
         """Log into Albert and save the authentication state.
@@ -444,6 +509,12 @@ class AlbertClient(LMSClient):
                 browser.close()
                 raise RuntimeError("Authentication session expired.")
             page.wait_for_load_state("networkidle")
+            if fmt in ("html", "both"):
+                # Best effort: without it, some students only get thumbnails.
+                try:
+                    self._cache_large_photos(page, class_number, term, instructor_id)
+                except Exception as e:
+                    logger.warning(f"Could not cache large photos for class {class_number}: {e}")
             page.goto(self._course_url(self.course_base_url, class_number, term, instructor_id))
             page.wait_for_load_state("networkidle")
             result = self._save_roster_formats(page, save_dir, fmt)
