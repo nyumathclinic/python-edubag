@@ -15,6 +15,7 @@ from edubag import (  # noqa: E402
     brightspace,  # noqa: F401
     edstem,  # noqa: F401
     polleverywhere,  # noqa: F401
+    webassign,  # noqa: F401
 )
 
 if __name__ == "__main__":
