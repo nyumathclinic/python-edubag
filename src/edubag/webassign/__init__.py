@@ -189,6 +189,36 @@ def sync_scores(
         raise typer.Exit(code=1)
 
 
+def _convert(kind: str, path: Path, section: str | None, output_dir: Path | None) -> None:
+    from .export import WebAssignRoster, WebAssignScores
+
+    parser = WebAssignRoster if kind == "roster" else WebAssignScores
+    data = parser.from_csv(path)
+    stem = f"{kind}_{section}" if section else path.stem
+    out = output_dir or path.parent
+    for target in (data.to_csv(out / f"{stem}.csv"), data.to_json(out / f"{stem}.json")):
+        typer.echo(str(target))
+
+
+ExportPath = Annotated[Path, typer.Argument(help="CSV file downloaded from WebAssign")]
+SectionId = Annotated[
+    str | None, typer.Option(help="WebAssign section ID for the output file names (default: input name)")
+]
+OutputDir = Annotated[Path | None, typer.Option(help="Output directory (default: next to the input)")]
+
+
+@app.command("convert-roster")
+def convert_roster(path: ExportPath, section: SectionId = None, output_dir: OutputDir = None) -> None:
+    """Write a WebAssign roster download as a plain CSV and a JSON file."""
+    _convert("roster", path, section, output_dir)
+
+
+@app.command("convert-scores")
+def convert_scores(path: ExportPath, section: SectionId = None, output_dir: OutputDir = None) -> None:
+    """Write a WebAssign scores download as a plain CSV and a JSON file."""
+    _convert("scores", path, section, output_dir)
+
+
 # Register the webassign app as a subcommand with the main app
 main_app.add_typer(app, name="webassign")
 app.add_typer(client_app, name="client")
