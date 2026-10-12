@@ -14,7 +14,7 @@ from edubag.gradescope.scoresheet import (
     VersionedScoresheet,
 )
 
-from .client import GradescopeClient
+from .client import REGION_WARNING, GradescopeClient
 
 # Create a local Typer app for gradescope subcommands
 app = typer.Typer(help="Gradescope management commands")
@@ -539,6 +539,73 @@ def save_container_scores(
             failed = True
     if failed:
         raise typer.Exit(code=1)
+
+
+@client_app.command("replace-pdf")
+def replace_pdf(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    assignment: Annotated[
+        str, typer.Argument(help="Gradescope assignment ID, or its title (e.g. 'Problem Set 7')")
+    ],
+    pdf_path: Annotated[
+        Path, typer.Argument(help="The new template PDF", exists=True, dir_okay=False, readable=True)
+    ],
+    exam_ok: Annotated[
+        bool,
+        typer.Option(
+            "--exam-ok",
+            help="Replace the PDF of an Exam/Quiz, whose question regions you must then check by hand",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Find the form controls but submit nothing")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Replace an assignment's template PDF, then re-save its outline.
+
+    ASSIGNMENT may be an ID or the assignment's title, which is matched
+    ignoring case and must be unique in the course.
+
+    A Problem Set (variable length) has no question regions, so this is safe.
+    An Exam/Quiz (templated) has regions drawn on the template that a new PDF
+    can leave misplaced: it is refused unless --exam-ok is given.
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        result = client.replace_template_pdf(
+            course=course,
+            assignment=assignment,
+            pdf_path=pdf_path,
+            allow_region_shift=exam_ok,
+            dry_run=dry_run,
+            headless=headless,
+        )
+    except Exception as e:
+        typer.echo(f"Failed to replace PDF for assignment '{assignment}' in course {course}: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    label = f"'{result['title']}' (assignment {result['assignment']}, {result['type']})"
+    if result["dry_run"]:
+        typer.echo(f"Dry run: ready to replace the PDF of {label} with {pdf_path.name}; nothing submitted.")
+        if result["regions_need_review"]:
+            typer.echo("A real run needs --exam-ok: " + REGION_WARNING + ".")
+        return
+    typer.echo(f"Replaced the PDF of {label} with {pdf_path.name} and saved the outline.")
+    if result["regions_need_review"]:
+        typer.echo(f"Warning: {REGION_WARNING}: {result['outline_url']}")
 
 
 # Register the gradescope app as a subcommand with the main app

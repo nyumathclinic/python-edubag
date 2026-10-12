@@ -54,6 +54,61 @@ def _run_sync_in_thread(func: Callable[..., T], *args, **kwargs) -> T:
     return result_container[0]
 
 
+# Values of the settings form's "Submission Type" radio.
+SUBMISSION_TYPE_LABELS = {"image": "Problem Set (variable length)", "pdf": "Exam/Quiz (templated, fixed length)"}
+
+REGION_WARNING = (
+    "its question regions may no longer line up with the new PDF; "
+    "check them on the Edit Outline page"
+)
+
+
+def template_has_regions(submission_type: str | None) -> bool:
+    """Whether an assignment's outline has question regions drawn on its template.
+
+    Variable-length assignments ("image", Gradescope's Problem Set) have none.
+    Templated ones ("pdf", Exam/Quiz) do, and so does anything unrecognized, to
+    be safe.
+    """
+    return submission_type != "image"
+
+
+def find_assignment_id(table_data: list[dict], name: str) -> str:
+    """Find an assignment's ID by title in an Assignments page's ``table_data``.
+
+    Titles are compared ignoring case and surrounding or repeated whitespace.
+
+    Raises:
+        LookupError: If no assignment, or more than one, has that title.
+    """
+
+    def normalize(title: str) -> str:
+        return " ".join(str(title).split()).casefold()
+
+    assignments = [e for e in table_data if e.get("type") == "assignment" and e.get("url")]
+    matches = [e for e in assignments if normalize(e.get("title", "")) == normalize(name)]
+    if not matches:
+        titles = ", ".join(f"'{e.get('title')}'" for e in assignments) or "none"
+        raise LookupError(f"No assignment titled '{name}'. Assignments in this course: {titles}")
+    if len(matches) > 1:
+        ids = ", ".join(e["url"].rstrip("/").rsplit("/", 1)[-1] for e in matches)
+        raise LookupError(f"More than one assignment is titled '{name}' (IDs {ids}); use an ID instead")
+    return matches[0]["url"].rstrip("/").rsplit("/", 1)[-1]
+
+
+def validate_pdf(pdf_path: Path) -> Path:
+    """Check that a path is an existing PDF file."""
+    pdf_path = Path(pdf_path)
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if pdf_path.suffix.lower() != ".pdf":
+        raise ValueError(f"Not a .pdf file: {pdf_path}")
+    with pdf_path.open("rb") as f:
+        if f.read(4) != b"%PDF":
+            raise ValueError(f"File does not look like a PDF: {pdf_path}")
+    return pdf_path
+
+
 class GradescopeClient(LMSClient):
     """Client to interact with the Gradescope platform.
 
@@ -979,11 +1034,7 @@ class GradescopeClient(LMSClient):
                     raise RuntimeError("Authentication session expired. Please re-authenticate.")
 
                 # The Assignments page renders its full table as one embedded JSON blob.
-                table = page.locator('[data-react-class="AssignmentsTable"]')
-                table_data = []
-                if table.count() > 0:
-                    props = json.loads(table.get_attribute("data-react-props") or "{}")
-                    table_data = props.get("table_data", [])
+                table_data = self._read_assignments_table(page)
 
                 browser.close()
                 return table_data
@@ -1163,5 +1214,222 @@ class GradescopeClient(LMSClient):
 
                 browser.close()
                 return results
+
+        return _run_sync_in_thread(_do)
+
+    def _course_url(self, course: str) -> str:
+        """URL of a course home page, given a course ID or course URL."""
+        if course.startswith("http://") or course.startswith("https://"):
+            return course.rstrip("/")
+        return f"{self.base_url}/courses/{course}"
+
+    def _assignment_url(self, course: str, assignment: str) -> str:
+        """URL of an assignment, given a course ID or course URL."""
+        return f"{self._course_url(course)}/assignments/{assignment}"
+
+    @staticmethod
+    def _read_assignments_table(page: Page) -> list[dict]:
+        """The Assignments page's embedded table data (the page must be loaded)."""
+        table = page.locator('[data-react-class="AssignmentsTable"]')
+        if table.count() == 0:
+            return []
+        return json.loads(table.get_attribute("data-react-props") or "{}").get("table_data", [])
+
+    def replace_template_pdf(
+        self,
+        course: str,
+        assignment: str,
+        pdf_path: Path,
+        allow_region_shift: bool = False,
+        dry_run: bool = False,
+        headless: bool = True,
+    ) -> dict:
+        """Replace an assignment's template PDF and re-save its outline.
+
+        This is the settings page's "Replace PDF" followed by "Save Assignment"
+        and, on the outline page that follows, "Save Outline".
+
+        A templated assignment (Exam/Quiz) has question regions drawn on its
+        template, which a new PDF can leave misplaced; it is refused unless
+        ``allow_region_shift`` is set. A variable-length assignment (Problem
+        Set) has no regions.
+
+        Args:
+            course: Gradescope course ID or URL to the course home page.
+            assignment: Gradescope assignment ID, or the assignment's title
+                (matched ignoring case; it must be unique in the course).
+            pdf_path: The new template PDF.
+            allow_region_shift: Proceed even if the assignment has question regions.
+            dry_run: Find the form controls and report, but submit nothing.
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            dict: ``course``, ``assignment``, ``title``, ``pdf``, ``type``,
+                ``regions_need_review``, ``uploaded``, ``outline_saved``,
+                ``outline_url`` and ``dry_run``.
+
+        Raises:
+            RuntimeError: If authentication has expired or a save fails.
+            LookupError: If no assignment, or more than one, has the given title.
+            PermissionError: If the assignment has question regions and
+                ``allow_region_shift`` is not set.
+        """
+        pdf_path = validate_pdf(pdf_path)
+        if not self.auth_state_path.exists():
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
+            self.authenticate(headless=headless)
+
+        # Stages completed so far, so a retry never uploads twice.
+        state: dict = {}
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                return self._replace_template_pdf_session(
+                    course, assignment, pdf_path, allow_region_shift, dry_run, headless, state
+                )
+            except RuntimeError as e:
+                if attempt < max_retries and "Authentication session expired" in str(e):
+                    logger.warning(f"RuntimeError: {e} Re-authenticating...")
+                    if self.auth_state_path.exists():
+                        self.auth_state_path.unlink()
+                    self.authenticate(headless=headless)
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
+    def _replace_template_pdf_session(
+        self,
+        course: str,
+        assignment: str,
+        pdf_path: Path,
+        allow_region_shift: bool,
+        dry_run: bool,
+        headless: bool,
+        state: dict,
+    ) -> dict:
+        """Internal: replace a template PDF in a single browser session.
+
+        ``state`` carries the result and completed stages across a
+        re-authentication retry. Raises RuntimeError if authentication has expired.
+        """
+
+        def _expired(page: Page) -> None:
+            if "login" in page.url:
+                raise RuntimeError("Authentication session expired. Please re-authenticate.")
+
+        def _do() -> dict:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    if dry_run:
+                        # A dry run must not change anything.
+                        context.route(
+                            "**/*",
+                            lambda route: route.continue_()
+                            if route.request.method in ("GET", "HEAD")
+                            else route.abort(),
+                        )
+                    page = context.new_page()
+
+                    if "assignment_id" not in state:
+                        if assignment.isdigit():
+                            state["assignment_id"] = assignment
+                        else:
+                            # Look the title up on the Assignments page.
+                            page.goto(f"{self._course_url(course)}/assignments")
+                            page.wait_for_load_state("networkidle")
+                            _expired(page)
+                            state["assignment_id"] = find_assignment_id(
+                                self._read_assignments_table(page), assignment
+                            )
+                    assignment_id = state["assignment_id"]
+                    assignment_url = self._assignment_url(course, assignment_id)
+                    outline_url = f"{assignment_url}/outline/edit"
+
+                    if not state.get("uploaded"):
+                        page.goto(f"{assignment_url}/edit")
+                        page.wait_for_load_state("domcontentloaded")
+                        _expired(page)
+                        form = page.locator("form#assignment_form")
+                        try:
+                            form.wait_for(state="attached", timeout=30000)
+                        except PlaywrightTimeoutError as exc:
+                            raise RuntimeError(f"No assignment settings form at {assignment_url}/edit") from exc
+
+                        checked = form.locator("input[name='assignment[submission_type]']:checked")
+                        submission_type = checked.get_attribute("value") if checked.count() else None
+                        needs_review = template_has_regions(submission_type)
+                        # The title is an input, or fixed text when the assignment is linked to an LMS.
+                        title_input = form.locator("#assignment_title")
+                        locked_title = page.locator(".lockedAssignmentName--title")
+                        if title_input.count():
+                            title = title_input.input_value()
+                        elif locked_title.count():
+                            title = locked_title.first.inner_text().strip()
+                        else:
+                            title = f"assignment {assignment_id}"
+                        state["result"] = {
+                            "course": course,
+                            "assignment": assignment_id,
+                            "title": title,
+                            "pdf": str(pdf_path),
+                            "type": SUBMISSION_TYPE_LABELS.get(submission_type, "unknown"),
+                            "regions_need_review": needs_review,
+                            "uploaded": False,
+                            "outline_saved": False,
+                            "outline_url": outline_url,
+                            "dry_run": dry_run,
+                        }
+                        result = state["result"]
+                        if needs_review and not allow_region_shift and not dry_run:
+                            raise PermissionError(
+                                f"'{result['title']}' is of type {result['type']}: {REGION_WARNING}. "
+                                "Pass allow_region_shift (--exam-ok) to replace its PDF anyway."
+                            )
+
+                        # "Replace PDF" is a styled label for this hidden file input.
+                        # The Save button sits in the action bar, outside the <form> element.
+                        file_input = page.locator("input[type='file'][name='template_pdf']")
+                        save = page.get_by_role("button", name="Save Assignment")
+                        if file_input.count() == 0 or save.count() == 0:
+                            raise RuntimeError("Could not find the Replace PDF input or Save Assignment button")
+                        file_input.set_input_files(pdf_path)
+                        if dry_run:
+                            logger.info(f"Dry run: ready to replace the PDF of '{result['title']}'; nothing submitted")
+                            return result
+
+                        save.click()
+                        try:
+                            page.wait_for_url("**/outline/edit", timeout=120000)
+                        except PlaywrightTimeoutError as exc:
+                            _expired(page)
+                            raise RuntimeError(
+                                f"Save Assignment did not lead to the outline page (now at {page.url})"
+                            ) from exc
+                        state["uploaded"] = result["uploaded"] = True
+                        logger.info(f"Replaced the template PDF of '{result['title']}'")
+                    else:
+                        page.goto(outline_url)
+                        _expired(page)
+
+                    result = state["result"]
+                    save_outline = page.get_by_role("button", name="Save Outline")
+                    save_outline.wait_for(state="visible", timeout=60000)
+                    with page.expect_response(
+                        lambda r: r.request.method != "GET" and f"/assignments/{assignment_id}" in r.url,
+                        timeout=120000,
+                    ) as response_info:
+                        save_outline.click()
+                    response = response_info.value
+                    if not response.ok and response.status not in (301, 302, 303):
+                        raise RuntimeError(f"Save Outline failed: HTTP {response.status}")
+                    state["outline_saved"] = result["outline_saved"] = True
+                    logger.info(f"Saved the outline of '{result['title']}'")
+                    return result
+                finally:
+                    browser.close()
 
         return _run_sync_in_thread(_do)

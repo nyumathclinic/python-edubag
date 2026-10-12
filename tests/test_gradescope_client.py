@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from edubag.albert.term import Season, Term
+from edubag.gradescope import client as gs_client
 from edubag.gradescope.client import GradescopeClient
 
 
@@ -240,3 +241,107 @@ class TestGradescopeClient:
             pytest.skip("Auth state not found. Run gradescope client authenticate first.")
 
         client.send_roster(course="1227659", csv_path=roster_path, headless=True)
+
+
+class TestReplaceTemplatePdf:
+    """Test replacing an assignment's template PDF (no network)."""
+
+    @staticmethod
+    def _client(tmp_path: Path) -> GradescopeClient:
+        auth = tmp_path / "auth.json"
+        auth.write_text("{}")
+        return GradescopeClient(auth_state_path=auth)
+
+    @staticmethod
+    def _pdf(tmp_path: Path, name: str = "ps.pdf", content: bytes = b"%PDF-1.7 synthetic") -> Path:
+        path = tmp_path / name
+        path.write_bytes(content)
+        return path
+
+    @pytest.mark.parametrize(
+        ("submission_type", "expected"),
+        [("image", False), ("pdf", True), (None, True), ("something-new", True)],
+    )
+    def test_template_has_regions(self, submission_type, expected):
+        assert gs_client.template_has_regions(submission_type) is expected
+
+    def test_assignment_url(self, tmp_path):
+        client = self._client(tmp_path)
+        assert client._assignment_url("123", "456") == f"{client.base_url}/courses/123/assignments/456"
+        assert (
+            client._assignment_url("https://www.gradescope.com/courses/123/", "456")
+            == "https://www.gradescope.com/courses/123/assignments/456"
+        )
+
+    def test_find_assignment_id(self):
+        table = [
+            {"type": "assignment", "title": "Problem Set 7", "url": "/courses/1/assignments/70"},
+            {"type": "assignment", "title": "Quiz 1", "url": "/courses/1/assignments/10"},
+            {"type": "assignment", "title": "Quiz  1 ", "url": "/courses/1/assignments/11"},
+            {"type": "assignment_container", "title": "Midterm", "url": "/courses/1/assignment_containers/5"},
+        ]
+        assert gs_client.find_assignment_id(table, "problem set 7") == "70"
+        assert gs_client.find_assignment_id(table, "  Problem   Set 7 ") == "70"
+        with pytest.raises(LookupError, match="No assignment titled 'Problem Set 8'.*'Problem Set 7'"):
+            gs_client.find_assignment_id(table, "Problem Set 8")
+        with pytest.raises(LookupError, match="More than one.*10, 11"):
+            gs_client.find_assignment_id(table, "Quiz 1")
+        with pytest.raises(LookupError, match="No assignment titled 'Midterm'"):
+            gs_client.find_assignment_id(table, "Midterm")
+
+    def test_validate_pdf(self, tmp_path):
+        assert gs_client.validate_pdf(self._pdf(tmp_path)) == tmp_path / "ps.pdf"
+        with pytest.raises(FileNotFoundError):
+            gs_client.validate_pdf(tmp_path / "missing.pdf")
+        with pytest.raises(ValueError, match="Not a .pdf file"):
+            gs_client.validate_pdf(self._pdf(tmp_path, "ps.txt"))
+        with pytest.raises(ValueError, match="does not look like a PDF"):
+            gs_client.validate_pdf(self._pdf(tmp_path, "fake.pdf", b"hello"))
+
+    def test_bad_pdf_rejected_before_browser(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path)
+        monkeypatch.setattr(client, "_replace_template_pdf_session", lambda *a: pytest.fail("session started"))
+        with pytest.raises(ValueError):
+            client.replace_template_pdf("123", "456", self._pdf(tmp_path, "fake.pdf", b"hello"))
+
+    def test_retry_after_reauth_keeps_upload_state(self, tmp_path, monkeypatch):
+        """A session that expires after the upload is retried without uploading again."""
+        client = self._client(tmp_path)
+        monkeypatch.setattr(client, "authenticate", lambda headless=False: None)
+        seen = []
+
+        def session(course, assignment, pdf_path, allow, dry_run, headless, state):
+            seen.append(dict(state))
+            if not state.get("uploaded"):
+                state["uploaded"] = True
+                raise RuntimeError("Authentication session expired. Please re-authenticate.")
+            return {"uploaded": True, "outline_saved": True}
+
+        monkeypatch.setattr(client, "_replace_template_pdf_session", session)
+        result = client.replace_template_pdf("123", "456", self._pdf(tmp_path))
+        assert result == {"uploaded": True, "outline_saved": True}
+        assert seen == [{}, {"uploaded": True}]
+
+    def test_other_errors_are_not_retried(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path)
+        monkeypatch.setattr(client, "authenticate", lambda headless=False: pytest.fail("re-authenticated"))
+        calls = []
+
+        def session(*args):
+            calls.append(1)
+            raise RuntimeError("Save Outline failed: HTTP 500")
+
+        monkeypatch.setattr(client, "_replace_template_pdf_session", session)
+        with pytest.raises(RuntimeError, match="Save Outline failed"):
+            client.replace_template_pdf("123", "456", self._pdf(tmp_path))
+        assert len(calls) == 1
+
+    def test_cli_help(self):
+        from typer.testing import CliRunner
+
+        from edubag.gradescope import app
+
+        result = CliRunner().invoke(app, ["client", "replace-pdf", "--help"])
+        assert result.exit_code == 0
+        assert "--exam-ok" in result.output
+
