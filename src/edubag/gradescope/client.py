@@ -4,8 +4,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import threading
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -869,6 +871,28 @@ class GradescopeClient(LMSClient):
         """
         return self.container_versions(self.list_assignments(course, headless), container)
 
+    def _container_version_links(self, page: Page, course: str, container: str) -> list[tuple[str, str]]:
+        """(assignment ID, link text) of each version of a container, from its Review Grades page.
+
+        Unlike the Assignments table, this also lists the versions of bubble-sheet version sets.
+
+        Raises:
+            RuntimeError: If authentication has expired or the container has no versions.
+        """
+        page.goto(f"{self._course_url(course)}/assignment_containers/{container}/review_grades")
+        page.wait_for_load_state("networkidle")
+        if "login" in page.url:
+            raise RuntimeError("Authentication session expired. Please re-authenticate.")
+        links: list[tuple[str, str]] = []
+        for link in page.locator('a[href$="/review_grades"]').all():
+            match = re.search(r"/assignments/(\d+)/review_grades$", link.get_attribute("href") or "")
+            if match is None or any(aid == match[1] for aid, _ in links):
+                continue
+            links.append((match[1], " ".join(link.inner_text().split())))
+        if not links:
+            raise RuntimeError(f"No versions found for assignment container {container}")
+        return links
+
     def save_grading_snapshot(
         self,
         course: str,
@@ -943,27 +967,17 @@ class GradescopeClient(LMSClient):
                             raise RuntimeError(f"No assignment container {container} in course {course}")
                         listed = {v["id"]: v for v in self.container_versions(table_data, container)}
 
-                        page.goto(f"{self._course_url(course)}/assignment_containers/{container}/review_grades")
-                        page.wait_for_load_state("networkidle")
-                        expired(page)
                         versions = []
-                        for link in page.locator('a[href$="/review_grades"]').all():
-                            match = re.search(r"/assignments/(\d+)/review_grades$", link.get_attribute("href") or "")
-                            if match is None or any(v["id"] == match[1] for v in versions):
-                                continue
+                        for aid, link_text in self._container_version_links(page, course, container):
                             version = {
-                                "id": match[1],
+                                "id": aid,
                                 "title": None,
                                 "num_active_submissions": None,
                                 "grading_progress": None,
-                                **listed.get(match[1], {}),
+                                **listed.get(aid, {}),
                             }
-                            version["version_name"] = " ".join(link.inner_text().split()) or version.get(
-                                "version_name"
-                            )
+                            version["version_name"] = link_text or version.get("version_name")
                             versions.append(version)
-                        if not versions:
-                            raise RuntimeError(f"No versions found for assignment container {container}")
 
                         for version in versions:
                             page.goto(f"{self._assignment_url(course, version['id'])}/grade")
@@ -997,6 +1011,178 @@ class GradescopeClient(LMSClient):
             return path
 
         return self._with_reauth(lambda: _run_sync_in_thread(_do), headless, username, password)
+
+    @staticmethod
+    def export_status(generated_file: dict | None) -> str:
+        """Status of a Gradescope generated file ("completed", "failed", or in progress), or "none"."""
+        if not generated_file or generated_file.get("id") is None:
+            return "none"
+        return str(generated_file.get("status") or "pending")
+
+    def _export_submissions_in_page(
+        self,
+        page: Page,
+        course: str,
+        assignment: str,
+        save_dir: Path,
+        fresh: bool,
+        extract: bool,
+        timeout: float,
+    ) -> Path:
+        """Export one assignment's submissions with an authenticated page; see save_submissions_export."""
+        page.goto(f"{self._assignment_url(course, assignment)}/review_grades")
+        page.wait_for_load_state("networkidle")
+        if "login" in page.url:
+            raise RuntimeError("Authentication session expired. Please re-authenticate.")
+        gon = page.evaluate("() => window.gon || {}")
+        create_path = gon.get("create_bulk_export_path")
+        file_path = gon.get("generated_file_path")
+        if not create_path or not file_path:
+            raise RuntimeError(f"No Export Submissions on {page.url}")
+        generated = gon.get("generated_file") or {}
+
+        if fresh or self.export_status(generated) != "completed":
+            csrf = page.locator('meta[name="csrf-token"]').get_attribute("content")
+            # Resolve against page.url: a POST across the gradescope.com -> www redirect becomes a GET.
+            response = page.request.post(
+                urljoin(page.url, create_path),
+                headers={"X-CSRF-Token": csrf or "", "Accept": "application/json"},
+            )
+            if not response.ok:
+                raise RuntimeError(f"Starting the export failed: HTTP {response.status}: {response.text()[:200]}")
+            generated = {"id": response.json()["generated_file_id"], "status": "pending"}
+            logger.info(f"Started export {generated['id']} of assignment {assignment}")
+
+        status_url = urljoin(page.url, file_path.replace("generated_file_id", str(generated["id"])) + ".json")
+        deadline = time.monotonic() + timeout
+        last_progress = None
+        while (status := self.export_status(generated)) != "completed":
+            if status == "failed":
+                raise RuntimeError(f"Gradescope export {generated['id']} of assignment {assignment} failed")
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Timed out after {timeout:.0f} s waiting for export {generated['id']}")
+            time.sleep(2)
+            response = page.request.get(status_url, headers={"Accept": "application/json"})
+            if response.ok:
+                generated = response.json()
+                progress = generated.get("progress")
+                if progress != last_progress:
+                    logger.info(f"Export {generated.get('id')}: {self.export_status(generated)} {progress}")
+                    last_progress = progress
+
+        # The signed S3 URL in the status; the ".zip" endpoint only redirects there. Right after
+        # the export completes the object may not be on S3 yet, so retry a 403/404 a few times.
+        zip_url = generated.get("url") or urljoin(
+            page.url, file_path.replace("generated_file_id", str(generated["id"])) + ".zip"
+        )
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = save_dir / f"assignment_{assignment}_export.zip"
+        for attempt in range(6):
+            response = page.request.get(zip_url, timeout=0)  # exports can be hundreds of MB
+            if response.ok or response.status not in (403, 404) or attempt == 5:
+                break
+            time.sleep(5)
+        if not response.ok:
+            raise RuntimeError(f"Downloading export {generated['id']} failed: HTTP {response.status}")
+        zip_path.write_bytes(response.body())
+        logger.info(f"Saved submissions export of assignment {assignment} to {zip_path}")
+        if not extract:
+            return zip_path
+        return self.extract_submissions_export(zip_path, save_dir)
+
+    @staticmethod
+    def extract_submissions_export(zip_path: Path, save_dir: Path) -> Path:
+        """Unzip a submissions export into ``save_dir``, replacing an earlier extraction; delete the zip.
+
+        Returns the ``assignment_<id>_export`` folder.
+        """
+        with zipfile.ZipFile(zip_path) as zf:
+            tops = {Path(name).parts[0] for name in zf.namelist() if name.strip("/")}
+            if len(tops) != 1:
+                raise RuntimeError(f"{zip_path}: expected one top-level folder, found {sorted(tops)}")
+            top = save_dir / tops.pop()
+            if top.exists():
+                shutil.rmtree(top)
+            zf.extractall(save_dir)
+        zip_path.unlink()
+        logger.info(f"Extracted submissions export to {top}")
+        return top
+
+    def save_submissions_export(
+        self,
+        course: str,
+        assignments: list[str],
+        save_dir: Path,
+        fresh: bool = True,
+        extract: bool = True,
+        timeout: float = 600,
+        headless: bool = True,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> list[Path]:
+        """Export submissions (the "Export Submissions" button on Review Grades) and download them.
+
+        Gradescope builds the export in the background; this starts one, waits for it, and
+        downloads the zip, which holds an ``assignment_<id>_export/`` folder of one PDF per
+        submission plus ``submission_metadata.yml``. All assignments share one browser session.
+
+        Args:
+            course: Gradescope course ID.
+            assignments: Assignment IDs (for a version set, the version assignments; see
+                ``export_container_submissions``).
+            save_dir: Directory for the downloads.
+            fresh: Start a new export even if a completed one exists. The existing one may be
+                stale: Gradescope offers it again after more submissions are uploaded.
+            extract: Unzip into ``save_dir`` (replacing an earlier extraction) and delete the zip.
+            timeout: Seconds to wait for each export to be built.
+
+        Returns:
+            One path per assignment: its export folder, or its zip if not ``extract``.
+        """
+
+        def _do() -> list[Path]:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    page = browser.new_context(storage_state=self.auth_state_path).new_page()
+                    return [
+                        self._export_submissions_in_page(page, course, a, save_dir, fresh, extract, timeout)
+                        for a in assignments
+                    ]
+                finally:
+                    browser.close()
+
+        return self._with_reauth(lambda: _run_sync_in_thread(_do), headless, username, password)
+
+    def export_container_submissions(
+        self,
+        course: str,
+        container: str,
+        save_dir: Path,
+        headless: bool = True,
+        username: str | None = None,
+        password: str | None = None,
+        **kwargs,
+    ) -> list[Path]:
+        """Export the submissions of every version of an assignment container (version set).
+
+        Keyword arguments are passed on to ``save_submissions_export``.
+        """
+
+        def _versions() -> list[str]:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    page = browser.new_context(storage_state=self.auth_state_path).new_page()
+                    return [aid for aid, _ in self._container_version_links(page, course, container)]
+                finally:
+                    browser.close()
+
+        versions = self._with_reauth(lambda: _run_sync_in_thread(_versions), headless, username, password)
+        return self.save_submissions_export(
+            course, versions, save_dir, headless=headless, username=username, password=password, **kwargs
+        )
 
     def send_roster(
         self,

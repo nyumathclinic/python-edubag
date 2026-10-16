@@ -107,3 +107,33 @@ def test_dashboard_progress_without_questions() -> None:
     df = dashboard_progress({"id": 7, "questions": {}, "leaf_question_ids": []})
     assert df.empty
     assert df[df["leaf"]].columns.tolist() == df.columns.tolist()
+
+
+def test_export_status() -> None:
+    assert GradescopeClient.export_status(None) == "none"
+    assert GradescopeClient.export_status({}) == "none"
+    assert GradescopeClient.export_status({"id": 5, "status": "completed"}) == "completed"
+    assert GradescopeClient.export_status({"id": 5}) == "pending"
+
+
+def test_extract_submissions_export_replaces_old_folder(tmp_path) -> None:
+    old = tmp_path / "assignment_42_export"
+    old.mkdir()
+    (old / "stale.pdf").write_bytes(b"old")
+    zip_path = tmp_path / "assignment_42_export.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("assignment_42_export/101.pdf", b"%PDF-1.4")
+        zf.writestr("assignment_42_export/submission_metadata.yml", "---\n")
+    folder = GradescopeClient.extract_submissions_export(zip_path, tmp_path)
+    assert folder == old
+    assert sorted(p.name for p in folder.iterdir()) == ["101.pdf", "submission_metadata.yml"]
+    assert not zip_path.exists()
+
+
+def test_extract_submissions_export_rejects_several_folders(tmp_path) -> None:
+    zip_path = tmp_path / "x.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("a/1.pdf", b"")
+        zf.writestr("b/2.pdf", b"")
+    with pytest.raises(RuntimeError):
+        GradescopeClient.extract_submissions_export(zip_path, tmp_path)

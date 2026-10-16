@@ -610,6 +610,52 @@ def grading_snapshot(
     typer.echo(f"Grading snapshot saved to {path}")
 
 
+@client_app.command("export-submissions")
+def export_submissions(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    ids: Annotated[
+        List[str],
+        typer.Argument(help="Assignment IDs, or assignment container IDs with --container"),
+    ],
+    container: Annotated[
+        bool, typer.Option("--container", help="IDS are version sets: export every version")
+    ] = False,
+    save_dir: Annotated[Path, typer.Option(help="Target directory")] = Path("."),
+    reuse: Annotated[
+        bool,
+        typer.Option("--reuse", help="Download an existing completed export instead of starting a new one"),
+    ] = False,
+    extract: Annotated[
+        bool, typer.Option("--extract/--no-extract", help="Unzip into SAVE_DIR and delete the zip")
+    ] = True,
+    timeout: Annotated[float, typer.Option(help="Seconds to wait for each export")] = 600,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Export submissions (PDFs + submission_metadata.yml) of assignments and download them."""
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    options = dict(fresh=not reuse, extract=extract, timeout=timeout, headless=headless)
+    paths: list[Path] = []
+    for item in ids:
+        if container:
+            paths += client.export_container_submissions(course, item, save_dir, **options)
+        else:
+            paths += client.save_submissions_export(course, [item], save_dir, **options)
+    for path in paths:
+        typer.echo(f"Submissions export saved to {path}")
+
+
 @client_app.command("replace-pdf")
 def replace_pdf(
     course: Annotated[str, typer.Argument(help="Gradescope course ID")],
