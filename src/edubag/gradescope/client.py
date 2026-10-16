@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
 from urllib.parse import urljoin
@@ -670,36 +671,50 @@ class GradescopeClient(LMSClient):
                     raise RuntimeError("Authentication session expired. Please re-authenticate.")
 
                 try:
-                    with page.expect_download(timeout=60000) as download_info:
-                        # Direct navigation to file endpoints can throw browser-level
-                        # navigation errors even when the download succeeds.
-                        try:
-                            page.goto(url)
-                        except PlaywrightError as exc:
-                            msg = str(exc)
-                            if "Download is starting" not in msg and "ERR_ABORTED" not in msg:
-                                raise
-                    download = download_info.value
-                except PlaywrightTimeoutError as exc:
-                    # No download event was observed. If we were redirected, auth likely expired.
-                    if "login" in page.url:
-                        browser.close()
-                        raise RuntimeError("Authentication session expired. Please re-authenticate.") from exc
+                    return self._download_in_page(page, url, save_dir)
+                finally:
                     browser.close()
-                    raise RuntimeError(f"Timed out waiting for download event at {url}") from exc
-
-                if save_dir is not None:
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    download_file_path = save_dir / download.suggested_filename
-                else:
-                    download_file_path = Path(download.suggested_filename)
-
-                logger.info(f"Saving {download.suggested_filename} to {download_file_path}")
-                download.save_as(download_file_path)
-                browser.close()
-                return download_file_path
 
         return _run_sync_in_thread(_do)
+
+    @staticmethod
+    def _download_in_page(
+        page: Page, url: str, save_dir: Path | None = None, filename: str | None = None
+    ) -> Path:
+        """Navigate an authenticated page to a download URL and save the file.
+
+        The file is saved as ``filename``, or by default under the name the server suggests.
+
+        Raises:
+            RuntimeError: If authentication has expired or no download starts.
+        """
+        try:
+            with page.expect_download(timeout=60000) as download_info:
+                # Direct navigation to file endpoints can throw browser-level
+                # navigation errors even when the download succeeds.
+                try:
+                    page.goto(url)
+                except PlaywrightError as exc:
+                    msg = str(exc)
+                    if "Download is starting" not in msg and "ERR_ABORTED" not in msg:
+                        raise
+            download = download_info.value
+        except PlaywrightTimeoutError as exc:
+            # No download event was observed. If we were redirected, auth likely expired.
+            if "login" in page.url:
+                raise RuntimeError("Authentication session expired. Please re-authenticate.") from exc
+            raise RuntimeError(f"Timed out waiting for download event at {url}") from exc
+
+        filename = filename or download.suggested_filename
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            download_file_path = save_dir / filename
+        else:
+            download_file_path = Path(filename)
+
+        logger.info(f"Saving {download.suggested_filename} to {download_file_path}")
+        download.save_as(download_file_path)
+        return download_file_path
 
     def _download_with_retry(
         self,
@@ -794,6 +809,194 @@ class GradescopeClient(LMSClient):
         )
         logger.debug(f"Downloading assignment container scores from {url}")
         return self._download_with_retry(url, save_dir, headless)
+
+    def _with_reauth(
+        self,
+        session: Callable[[], T],
+        headless: bool,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> T:
+        """Run a browser session, re-authenticating once if the saved session has expired."""
+        if not self.auth_state_path.exists():
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
+            self.authenticate(username=username, password=password, headless=headless)
+        try:
+            return session()
+        except RuntimeError as e:
+            if "Authentication session expired" not in str(e):
+                raise
+            logger.warning(f"RuntimeError: {e} Re-authenticating...")
+            if self.auth_state_path.exists():
+                self.auth_state_path.unlink()
+            self.authenticate(username=username, password=password, headless=headless)
+            return session()
+
+    @staticmethod
+    def container_versions(table_data: list[dict], container: str) -> list[dict]:
+        """The version assignments of an assignment container, from Assignments ``table_data``.
+
+        Returns:
+            list[dict]: One entry per version, in Gradescope's order, with ``id`` (assignment
+                ID), ``title``, ``version_name``, ``num_active_submissions`` and
+                ``grading_progress``.
+        """
+        versions = [
+            e
+            for e in table_data
+            if e.get("type") == "assignment" and str(e.get("container_id")) == str(container)
+        ]
+        versions.sort(key=lambda e: (e.get("version_index") is None, e.get("version_index")))
+        return [
+            {
+                "id": e["url"].rstrip("/").rsplit("/", 1)[-1],
+                "title": e.get("title"),
+                "version_name": e.get("version_name"),
+                "num_active_submissions": e.get("num_active_submissions"),
+                "grading_progress": e.get("grading_progress"),
+            }
+            for e in versions
+        ]
+
+    def list_container_versions(
+        self, course: str, container: str, headless: bool = True
+    ) -> list[dict]:
+        """List the version assignments of an assignment container (version set).
+
+        See ``container_versions`` for the fields of each entry.
+        """
+        return self.container_versions(self.list_assignments(course, headless), container)
+
+    def save_grading_snapshot(
+        self,
+        course: str,
+        containers: list[str],
+        save_dir: Path,
+        scores: bool = True,
+        headless: bool = True,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> Path:
+        """Save a snapshot of the grading of one or more assignment containers (version sets).
+
+        In a single browser session: finds each container's versions (the version links on its
+        Review Grades page, which unlike the Assignments table also lists bubble-sheet
+        versions), reads each version's Grading Dashboard (per-question graded/total counts
+        and graders), and, if ``scores``, downloads each version's scores CSV as
+        ``<assignment id>_scores.csv``.
+
+        Writes ``save_dir/dashboards.json``::
+
+            {"course": ..., "fetched_at": ISO time,
+             "containers": [{"id": ..., "title": ...,
+                             "versions": [{"id", "title", "version_name",
+                                           "num_active_submissions", "grading_progress",
+                                           "scores_csv": file name or null,
+                                           "dashboard": GradingDashboard assignment props}]}]}
+
+        ``version_name`` is the version's link text on the container page (e.g. "Version A");
+        ``title``, ``num_active_submissions`` and ``grading_progress`` come from the
+        Assignments table and are null for versions it does not list.
+
+        ``username``/``password`` are used to log in again if the saved session has expired.
+
+        Returns:
+            Path to ``dashboards.json``.
+
+        Raises:
+            RuntimeError: If authentication has expired, or a container or dashboard is not found.
+        """
+        save_dir = Path(save_dir)
+
+        def expired(page: Page) -> None:
+            if "login" in page.url:
+                raise RuntimeError("Authentication session expired. Please re-authenticate.")
+
+        def _do() -> Path:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(
+                        storage_state=self.auth_state_path, accept_downloads=True
+                    )
+                    page = context.new_page()
+                    page.goto(f"{self._course_url(course)}/assignments")
+                    page.wait_for_load_state("networkidle")
+                    expired(page)
+                    table_data = self._read_assignments_table(page)
+                    fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
+
+                    snapshot: dict = {"course": str(course), "fetched_at": fetched_at, "containers": []}
+                    for container in containers:
+                        entry = next(
+                            (
+                                e
+                                for e in table_data
+                                if e.get("type") == "assignment_container"
+                                and str(e.get("id")).rsplit("_", 1)[-1] == str(container)
+                            ),
+                            None,
+                        )
+                        if entry is None:
+                            raise RuntimeError(f"No assignment container {container} in course {course}")
+                        listed = {v["id"]: v for v in self.container_versions(table_data, container)}
+
+                        page.goto(f"{self._course_url(course)}/assignment_containers/{container}/review_grades")
+                        page.wait_for_load_state("networkidle")
+                        expired(page)
+                        versions = []
+                        for link in page.locator('a[href$="/review_grades"]').all():
+                            match = re.search(r"/assignments/(\d+)/review_grades$", link.get_attribute("href") or "")
+                            if match is None or any(v["id"] == match[1] for v in versions):
+                                continue
+                            version = {
+                                "id": match[1],
+                                "title": None,
+                                "num_active_submissions": None,
+                                "grading_progress": None,
+                                **listed.get(match[1], {}),
+                            }
+                            version["version_name"] = " ".join(link.inner_text().split()) or version.get(
+                                "version_name"
+                            )
+                            versions.append(version)
+                        if not versions:
+                            raise RuntimeError(f"No versions found for assignment container {container}")
+
+                        for version in versions:
+                            page.goto(f"{self._assignment_url(course, version['id'])}/grade")
+                            page.wait_for_load_state("networkidle")
+                            expired(page)
+                            dashboard = page.locator('[data-react-class="GradingDashboard"]')
+                            if dashboard.count() == 0:
+                                raise RuntimeError(f"No Grading Dashboard at {page.url}")
+                            props = json.loads(dashboard.get_attribute("data-react-props") or "{}")
+                            version["dashboard"] = props.get("presenter", {}).get("assignments", {}).get(version["id"])
+                            if version["dashboard"] is None:
+                                raise RuntimeError(f"Grading Dashboard at {page.url} has no data")
+                            version["scores_csv"] = None
+                            if scores:
+                                version["scores_csv"] = self._download_in_page(
+                                    page,
+                                    f"{self._assignment_url(course, version['id'])}/scores.csv",
+                                    save_dir,
+                                    filename=f"{version['id']}_scores.csv",
+                                ).name
+                        snapshot["containers"].append(
+                            {"id": str(container), "title": entry.get("title"), "versions": versions}
+                        )
+                finally:
+                    browser.close()
+
+            save_dir.mkdir(parents=True, exist_ok=True)
+            path = save_dir / "dashboards.json"
+            path.write_text(json.dumps(snapshot, indent=2))
+            logger.info(f"Saved grading snapshot of course {course} to {path}")
+            return path
+
+        return self._with_reauth(lambda: _run_sync_in_thread(_do), headless, username, password)
 
     def send_roster(
         self,

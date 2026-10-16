@@ -541,6 +541,75 @@ def save_container_scores(
         raise typer.Exit(code=1)
 
 
+@client_app.command("list-versions")
+def list_versions(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    assignment_container: Annotated[
+        str, typer.Argument(help="Gradescope assignment container ID")
+    ],
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """List the version assignments of an assignment container (version set)."""
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    for v in client.list_container_versions(course, assignment_container, headless=headless):
+        typer.echo(
+            f"{v['id']}\t{v['title']}\t{v['num_active_submissions']} submissions\t"
+            f"{v['grading_progress']}% graded"
+        )
+
+
+@client_app.command("grading-snapshot")
+def grading_snapshot(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    assignment_containers: Annotated[
+        List[str],
+        typer.Argument(help="One or more Gradescope assignment container IDs"),
+    ],
+    save_dir: Annotated[
+        Path, typer.Option(help="Target directory for dashboards.json and scores CSVs")
+    ] = Path("."),
+    scores: Annotated[
+        bool,
+        typer.Option("--scores/--no-scores", help="Also download each version's scores CSV"),
+    ] = True,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Save per-question grading progress (and scores) of assignment containers.
+
+    Reads the Grading Dashboard of every version of each ASSIGNMENT_CONTAINER into
+    SAVE_DIR/dashboards.json, and downloads each version's scores CSV.
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    path = client.save_grading_snapshot(
+        course, assignment_containers, save_dir, scores=scores, headless=headless
+    )
+    typer.echo(f"Grading snapshot saved to {path}")
+
+
 @client_app.command("replace-pdf")
 def replace_pdf(
     course: Annotated[str, typer.Argument(help="Gradescope course ID")],

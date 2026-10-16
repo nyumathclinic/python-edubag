@@ -144,14 +144,18 @@ class VersionedScoresheet(Scoresheet):
         self.scores = scores
 
     @classmethod
-    def from_zip(cls, zip_path: Path):
+    def from_zip(cls, zip_path: Path, drop_missing: bool = True):
         """Creates a VersionedScoresheet object from a Zip file.
 
         Reads each CSV file and parses it into a pandas DataFrame.
         Casts the columns to the appropriate data types.
 
+        Every column of every version CSV is kept, even one that is empty in all of them
+        (e.g. a question nobody has graded yet).
+
         Args:
             zip_path (Path): file handle to the Zip file.
+            drop_missing: Drop rows with Status == 'Missing'.
         Returns:
             A VersionedScoresheet object containing the scoresheet data.
         """
@@ -159,13 +163,15 @@ class VersionedScoresheet(Scoresheet):
             "_", " "
         )
         frames = []
+        columns: list[str] = []
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             for csv_path in version_csvs_from(zip_path):
                 with zip_ref.open(str(csv_path)) as f:
                     ss = Scoresheet.from_csv(
-                        f, drop_missing=True, filename=str(csv_path)
+                        f, drop_missing=drop_missing, filename=str(csv_path)
                     )
                     version_df = ss.scores.copy()
+                    columns += [c for c in version_df.columns if c not in columns]
                     # Drop all-NA columns before concat to keep pandas dtype
                     # inference stable across versions.
                     version_df = version_df.dropna(axis=1, how="all").copy()
@@ -179,6 +185,46 @@ class VersionedScoresheet(Scoresheet):
 
         if frames:
             df = pd.concat(frames, ignore_index=True)
+            # Restore the all-NA columns dropped above, in their original order.
+            df = df.reindex(columns=columns + ["Version"])
         else:
-            df = pd.DataFrame(columns=["Version"])
+            df = pd.DataFrame(columns=columns + ["Version"])
         return cls(name=name, scores=df)
+
+
+# Gradescope names a question's score column "<outline number>: <title> (<points> pts)".
+QUESTION_COLUMN_RE = re.compile(
+    r"^(?P<number>\d+(?:\.\d+)*): (?P<title>.*) \((?P<points>\d+(?:\.\d+)?) pts\)$"
+)
+
+
+def parse_question_column(column: str) -> Optional[tuple[str, str, float]]:
+    """Parse a scores CSV question column into (outline number, title, max points).
+
+    Returns None if the column is not a question column.
+    """
+    match = QUESTION_COLUMN_RE.match(str(column))
+    if match is None:
+        return None
+    return match["number"], match["title"], float(match["points"])
+
+
+def question_columns(df: pd.DataFrame) -> dict[str, str]:
+    """Map outline number ("1", "2.1", ...) to column name for a scores DataFrame's questions.
+
+    Raises:
+        ValueError: If two columns have the same outline number (e.g. a DataFrame that mixes
+            versions whose questions have different titles); split it by version first.
+    """
+    result: dict[str, str] = {}
+    for column in df.columns:
+        parsed = parse_question_column(column)
+        if parsed is None:
+            continue
+        number = parsed[0]
+        if number in result:
+            raise ValueError(
+                f"Question {number} has more than one column ({result[number]!r}, {column!r})"
+            )
+        result[number] = column
+    return result
