@@ -656,6 +656,81 @@ def export_submissions(
         typer.echo(f"Submissions export saved to {path}")
 
 
+@client_app.command("upload-scans")
+def upload_scans(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    assignment: Annotated[
+        str, typer.Argument(help="Assignment ID, or assignment container ID with --container")
+    ],
+    pdf_paths: Annotated[
+        List[Path],
+        typer.Argument(help="Scanned PDFs to upload", exists=True, dir_okay=False, readable=True),
+    ],
+    container: Annotated[
+        bool, typer.Option("--container", help="ASSIGNMENT is a version set's container")
+    ] = False,
+    allow_duplicates: Annotated[
+        bool,
+        typer.Option("--allow-duplicates", help="Upload a PDF even if one of the same name was uploaded"),
+    ] = False,
+    wait: Annotated[
+        bool,
+        typer.Option("--wait/--no-wait", help="Wait for Gradescope to split the scans into submissions"),
+    ] = True,
+    timeout: Annotated[float, typer.Option(help="Seconds to wait for the uploads")] = 900,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Check the page and for duplicates, but upload nothing")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Upload scanned PDFs on an assignment's Manage Scans page.
+
+    Gradescope splits each PDF into submissions and matches them to students.
+    Scans it couldn't split automatically need "Show" and "Create Submissions"
+    on the Manage Scans page.
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        results = client.upload_scans(
+            course=course,
+            assignment=assignment,
+            pdf_paths=pdf_paths,
+            container=container,
+            allow_duplicates=allow_duplicates,
+            wait=wait,
+            timeout=timeout,
+            dry_run=dry_run,
+            headless=headless,
+        )
+    except Exception as e:
+        typer.echo(f"Failed to upload scans to {assignment} in course {course}: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    if dry_run:
+        names = ", ".join(r["file"] for r in results)
+        typer.echo(f"Dry run: ready to upload {names}; nothing uploaded.")
+        return
+    for r in results:
+        typer.echo(
+            f"{r['file']}: {r['pages']} pages, {r['status']}, "
+            f"{r['submissions']} submissions (batch {r['batch']})"
+        )
+        if r["status"] != "was_automatically_split":
+            typer.echo(f"  Review this batch on the Manage Scans page: {r['status']}")
+
+
 @client_app.command("replace-pdf")
 def replace_pdf(
     course: Annotated[str, typer.Argument(help="Gradescope course ID")],

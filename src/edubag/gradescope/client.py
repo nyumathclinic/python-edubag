@@ -17,7 +17,6 @@ import platformdirs
 from dotenv import load_dotenv
 from loguru import logger
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -1824,6 +1823,223 @@ class GradescopeClient(LMSClient):
                     state["outline_saved"] = result["outline_saved"] = True
                     logger.info(f"Saved the outline of '{result['title']}'")
                     return result
+                finally:
+                    browser.close()
+
+        return _run_sync_in_thread(_do)
+
+    def _scans_url(self, course: str, assignment: str, container: bool) -> str:
+        """URL of the Manage Scans page of an assignment, or of a version set's container."""
+        kind = "assignment_containers" if container else "assignments"
+        return f"{self._course_url(course)}/{kind}/{assignment}/submission_batches"
+
+    @staticmethod
+    def scan_batch_summary(batch: dict) -> dict:
+        """The useful fields of a Manage Scans batch, as listed in its JSON."""
+        attachment = batch.get("pdf_attachment") or {}
+        return {
+            "batch": batch.get("id"),
+            "file": attachment.get("filename"),
+            "pages": batch.get("page_count"),
+            "complete_status": batch.get("complete_status"),
+            "status": batch.get("status"),
+            "upload_status": attachment.get("status_string"),
+            "submissions": batch.get("num_active_submissions"),
+        }
+
+    def upload_scans(
+        self,
+        course: str,
+        assignment: str,
+        pdf_paths: list[Path],
+        container: bool = False,
+        allow_duplicates: bool = False,
+        wait: bool = True,
+        timeout: float = 900,
+        dry_run: bool = False,
+        headless: bool = True,
+    ) -> list[dict]:
+        """Upload scanned PDFs on an assignment's Manage Scans page.
+
+        Gradescope splits each uploaded PDF into submissions (for a bubble sheet
+        assignment, by the markers on the sheet) and matches them to students by
+        their name and ID regions. A PDF whose split it can't propose needs
+        "Show" and "Create Submissions" by hand.
+
+        Args:
+            course: Gradescope course ID or URL to the course home page.
+            assignment: Gradescope assignment ID, or a container ID with ``container``.
+            pdf_paths: The PDFs to upload, each becoming one batch.
+            container: ``assignment`` is an assignment container (version set).
+            allow_duplicates: Upload a PDF even if a batch with its file name exists.
+            wait: Wait for Gradescope to finish processing each batch, not just
+                to receive it.
+            timeout: Seconds to wait for the uploads (and processing, with ``wait``).
+            dry_run: Check the page and the duplicates, but upload nothing.
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            list[dict]: One summary per PDF (see ``scan_batch_summary``), with ``path``;
+                with ``dry_run``, only ``path`` and ``file``.
+
+        Raises:
+            RuntimeError: If authentication has expired, or an upload fails or times out.
+            FileExistsError: If a PDF's name matches an existing batch and
+                ``allow_duplicates`` is not set.
+        """
+        pdf_paths = [validate_pdf(p) for p in pdf_paths]
+        names = [p.name for p in pdf_paths]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Several PDFs share a file name: {names}")
+        if not self.auth_state_path.exists():
+            logger.warning(
+                f"Auth state file not found at {self.auth_state_path}. Running authentication..."
+            )
+            self.authenticate(headless=headless)
+
+        # Batches that existed before this call, so a retry never uploads twice.
+        state: dict = {}
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                return self._upload_scans_session(
+                    course, assignment, pdf_paths, container, allow_duplicates, wait, timeout,
+                    dry_run, headless, state,
+                )  # fmt: skip
+            except RuntimeError as e:
+                if attempt < max_retries and "Authentication session expired" in str(e):
+                    logger.warning(f"RuntimeError: {e} Re-authenticating...")
+                    if self.auth_state_path.exists():
+                        self.auth_state_path.unlink()
+                    self.authenticate(headless=headless)
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
+    def _upload_scans_session(
+        self,
+        course: str,
+        assignment: str,
+        pdf_paths: list[Path],
+        container: bool,
+        allow_duplicates: bool,
+        wait: bool,
+        timeout: float,
+        dry_run: bool,
+        headless: bool,
+        state: dict,
+    ) -> list[dict]:
+        """Internal: upload scans in a single browser session.
+
+        ``state["before"]`` holds the IDs of batches that existed before the first
+        attempt. Raises RuntimeError if authentication has expired.
+        """
+        url = self._scans_url(course, assignment, container)
+        names = [path.name for path in pdf_paths]
+
+        def _do() -> list[dict]:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    if dry_run:
+                        # A dry run must not change anything.
+                        context.route(
+                            "**/*",
+                            lambda route: route.continue_()
+                            if route.request.method in ("GET", "HEAD")
+                            else route.abort(),
+                        )
+                    page = context.new_page()
+                    page.goto(url)
+                    page.wait_for_load_state("networkidle")
+                    if "login" in page.url:
+                        raise RuntimeError("Authentication session expired. Please re-authenticate.")
+
+                    def batches() -> list[dict]:
+                        response = page.request.get(f"{url}.json")
+                        if not response.ok:
+                            raise RuntimeError(f"Could not read the batches at {url}: HTTP {response.status}")
+                        return response.json().get("batches") or []
+
+                    current = batches()
+                    state.setdefault("before", {b["id"] for b in current})
+                    new = {
+                        (b.get("pdf_attachment") or {}).get("filename")
+                        for b in current
+                        if b["id"] not in state["before"]
+                    }
+                    # Files that a re-authenticated retry has already uploaded.
+                    todo = [path for path in pdf_paths if path.name not in new]
+                    if not allow_duplicates:
+                        existing = {
+                            (b.get("pdf_attachment") or {}).get("filename")
+                            for b in current
+                            if b["id"] in state["before"]
+                        }
+                        dups = [path.name for path in todo if path.name in existing]
+                        if dups:
+                            raise FileExistsError(
+                                f"Already uploaded to {url}: {', '.join(dups)}. "
+                                "Pass allow_duplicates (--allow-duplicates) to upload again."
+                            )
+
+                    # "Select PDF Files" opens this Dropzone input.
+                    file_input = page.locator("input.dz-hidden-input[type='file']")
+                    if file_input.count() == 0:
+                        raise RuntimeError(f"No scan upload input on {url}")
+                    if dry_run:
+                        logger.info(f"Dry run: ready to upload {len(todo)} PDF(s) to {url}; nothing uploaded")
+                        return [{"path": str(path), "file": path.name} for path in pdf_paths]
+
+                    if todo:
+                        file_input.set_input_files(todo)
+                        logger.info(f"Uploading {', '.join(path.name for path in todo)} to {url}")
+
+                    def ours() -> dict[str, dict]:
+                        found = {}
+                        for b in batches():
+                            name = (b.get("pdf_attachment") or {}).get("filename")
+                            if b["id"] not in state["before"] and name in names:
+                                found[name] = b
+                        return found
+
+                    deadline = time.monotonic() + timeout
+                    while True:
+                        errors = [
+                            t.strip()
+                            for t in page.locator(".dz-error-message").all_inner_texts()
+                            if t.strip()
+                        ]
+                        if errors:
+                            raise RuntimeError(f"Upload failed: {'; '.join(errors)}")
+                        found = ours()
+                        received = len(found) == len(names)
+                        processed = all(
+                            b.get("complete_status") == "ready"
+                            or (b.get("pdf_attachment") or {}).get("status_string") == "failed"
+                            for b in found.values()
+                        )
+                        if received and (processed or not wait):
+                            break
+                        if time.monotonic() > deadline:
+                            missing = [n for n in names if n not in found]
+                            pending = [n for n, b in found.items() if b.get("complete_status") != "ready"]
+                            raise RuntimeError(
+                                f"Timed out after {timeout:.0f}s; not received: {missing or 'none'}; "
+                                f"still processing: {pending or 'none'}"
+                            )
+                        page.wait_for_timeout(3000)
+
+                    results = []
+                    for path in pdf_paths:
+                        summary = {"path": str(path), **self.scan_batch_summary(found[path.name])}
+                        logger.info(
+                            f"{path.name}: batch {summary['batch']}, {summary['pages']} pages, "
+                            f"{summary['status']}, {summary['submissions']} submissions"
+                        )
+                        results.append(summary)
+                    return results
                 finally:
                     browser.close()
 
