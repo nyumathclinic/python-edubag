@@ -17,6 +17,7 @@ import platformdirs
 from dotenv import load_dotenv
 from loguru import logger
 from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -1333,11 +1334,16 @@ class GradescopeClient(LMSClient):
                     page.get_by_role("button", name="Next", exact=False).click()
                     page.get_by_role("button", name="Import", exact=False).click()
 
-                    # Wait for upload to complete (flash message or dialog close)
-                    page.wait_for_load_state("networkidle")
+                    # Wait for the import to finish: the page is already idle when Import is
+                    # clicked, so waiting on load state alone closes the browser too early and
+                    # the import is silently dropped. Gradescope posts a flash message when done.
+                    flash_messages = page.locator(".alert.alert-flashMessage")
+                    try:
+                        flash_messages.first.wait_for(state="visible", timeout=60000)
+                    except PlaywrightTimeoutError:
+                        logger.warning("No confirmation from Gradescope after roster import.")
 
                     # Extract and log all flash messages
-                    flash_messages = page.locator(".alert.alert-flashMessage")
                     if flash_messages.count() > 0:
                         for i in range(flash_messages.count()):
                             flash = flash_messages.nth(i)
