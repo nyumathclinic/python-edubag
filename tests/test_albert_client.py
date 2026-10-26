@@ -187,3 +187,17 @@ class TestReconcileStaleHeaderSection:
         class_details = {"section": "016", "full_course_name": "Discrete Mathematics"}
         AlbertClient._reconcile_stale_header_section(class_details)
         assert class_details["section"] == "016"
+
+
+class TestHeaderNamesClass:
+    """The roster header can name the previously fetched class (one fetch behind)."""
+
+    def test_matching_class_number(self):
+        assert AlbertClient._header_names_class({"class_number": 10434}, "10434")
+
+    def test_stale_class_number(self):
+        fields = {"class_number": 10433, "class_type": "Lecture"}
+        assert not AlbertClient._header_names_class(fields, 10434)
+
+    def test_header_without_class_number_is_accepted(self):
+        assert AlbertClient._header_names_class({"class_type": "Lecture"}, 10434)

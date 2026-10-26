@@ -424,23 +424,61 @@ class AlbertClient(LMSClient):
         roster_page.close()
         return class_details
 
-    def _extract_course_details_from_roster_page(self, roster_page: Page) -> dict:
-        """Extract class details from an already-open Albert roster page."""
+    def _read_roster_summary(
+        self, roster_page: Page, class_number: int | str | None = None, attempts: int = 3
+    ) -> dict:
+        """Fields from the roster page header and meeting summary.
+
+        These are `#win0divROSTER_HDRGRP` (course name, class number,
+        `class_type`, section) and `#win0divCLASS_MTG_NBR1$0`
+        (`days_and_times`, instructor, ...). When several classes are fetched
+        in a row via direct URLs, both can still show the previously loaded
+        class (see `_reconcile_stale_header_section`). Given the requested
+        `class_number`, reload until the header names that class. If it never
+        does, return no fields: they are better missing than copied from
+        another class.
+        """
+        for attempt in range(attempts):
+            header, metadata = (
+                self._extract_class_details_from_container(container)
+                if (container := roster_page.locator(selector)).count() > 0
+                else {}
+                for selector in ("#win0divROSTER_HDRGRP", "#win0divCLASS_MTG_NBR1\\$0")
+            )
+            if class_number is None or self._header_names_class(header, class_number):
+                return header | metadata
+            logger.warning(
+                f"Roster header shows class {header.get('class_number')}, not {class_number}; "
+                f"reloading ({attempt + 1}/{attempts})"
+            )
+            roster_page.reload()
+            roster_page.wait_for_load_state("networkidle")
+        logger.warning(
+            f"Roster header never showed class {class_number}; dropping its fields "
+            "(class_type, days_and_times, ...)"
+        )
+        return {}
+
+    @staticmethod
+    def _header_names_class(fields: dict, class_number: int | str) -> bool:
+        """Whether header fields belong to `class_number` (True if the header names no class)."""
+        header_class = fields.get("class_number")
+        return header_class is None or str(header_class).strip() == str(class_number).strip()
+
+    def _extract_course_details_from_roster_page(
+        self, roster_page: Page, class_number: int | str | None = None
+    ) -> dict:
+        """Extract class details from an already-open Albert roster page.
+
+        Pass the requested `class_number` when known, so a stale roster header
+        is detected (see `_read_roster_summary`).
+        """
 
         class_details = {}
-        # Extract class details from the roster page header
-        roster_metadata = roster_page.locator("#win0divROSTER_HDRGRP")
-        if roster_metadata.count() > 0:
-            roster_details = self._extract_class_details_from_container(roster_metadata)
-            class_details.update(roster_details)
-            logger.debug(f"Extracted {len(roster_details)} fields from roster page header")
-
-        # Extract class details from the roster page metadata section
-        roster_metadata = roster_page.locator("#win0divCLASS_MTG_NBR1\\$0")
-        if roster_metadata.count() > 0:
-            roster_details = self._extract_class_details_from_container(roster_metadata)
-            class_details.update(roster_details)
-            logger.debug(f"Extracted {len(roster_details)} fields from roster page")
+        # Extract class details from the roster page header and metadata section
+        roster_details = self._read_roster_summary(roster_page, class_number)
+        class_details.update(roster_details)
+        logger.debug(f"Extracted {len(roster_details)} fields from roster page header and metadata")
 
         # Click "Class meeting information"
         roster_page.get_by_text("Class meeting information").click()
@@ -485,8 +523,7 @@ class AlbertClient(LMSClient):
         logger.warning(
             "Roster header 'section' looks stale (got "
             f"'{header_section}', full_course_name implies '{derived_section}'); "
-            "correcting. Other header-only fields (class_type, instructor, "
-            "days_and_times) may still be stale for this class."
+            "correcting."
         )
         class_details["section"] = derived_section
 
@@ -582,7 +619,7 @@ class AlbertClient(LMSClient):
             page.wait_for_load_state("networkidle")
             page.goto(self._course_url(self.course_base_url, class_number, term, instructor_id))
             page.wait_for_load_state("networkidle")
-            result = self._extract_course_details_from_roster_page(page)
+            result = self._extract_course_details_from_roster_page(page, class_number)
             browser.close()
             return result
 
