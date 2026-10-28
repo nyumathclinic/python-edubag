@@ -189,6 +189,64 @@ def sync_scores(
         raise typer.Exit(code=1)
 
 
+@client_app.command("list-assignments")
+def list_assignments(
+    section: Annotated[str, typer.Argument(help="WebAssign section ID (see list-sections)")],
+    when: Annotated[str, typer.Option(help="Assignments to list: all, past, current or future")] = "all",
+    base_url: BaseUrl = None,
+    auth_state_path: AuthStatePath = None,
+    headless: Headless = True,
+) -> None:
+    """List a section's assignments and their IDs."""
+    client = WebAssignClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        for a in client.list_assignments(section, when=when, headless=headless):
+            typer.echo(f"{a['aid']}\t{a['due']}\t{a['name']}")
+    except Exception as e:
+        typer.echo(f"Error listing assignments: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+
+@client_app.command("export-assignment")
+def export_assignment(
+    assignments: Annotated[
+        list[str], typer.Argument(help="WebAssign assignment ID(s) (see list-assignments)")
+    ],
+    save_dir: Annotated[
+        Path | None, typer.Option(help="Parent directory for the exports (default: current directory)")
+    ] = None,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Re-export questions that were already exported")
+    ] = False,
+    keep_html: Annotated[
+        bool, typer.Option("--keep-html", help="Also save the editor pages' HTML")
+    ] = False,
+    delay: Annotated[float, typer.Option(help="Seconds to wait between questions")] = 1.0,
+    base_url: BaseUrl = None,
+    auth_state_path: AuthStatePath = None,
+    headless: Headless = True,
+) -> None:
+    """Export assignments and the source of their questions as JSON.
+
+    Reads the Assignment and Question Editors without saving anything.
+    """
+    client = WebAssignClient(base_url=base_url, auth_state_path=auth_state_path)
+    for assignment in assignments:
+        try:
+            path = client.export_assignment(
+                assignment,
+                save_dir=save_dir,
+                overwrite=overwrite,
+                keep_html=keep_html,
+                delay=delay,
+                headless=headless,
+            )
+        except Exception as e:
+            typer.echo(f"Error exporting assignment {assignment}: {e}", err=True)
+            raise typer.Exit(code=1) from e
+        typer.echo(f"Assignment {assignment} exported to {path}")
+
+
 def _convert(kind: str, path: Path, section: str | None, output_dir: Path | None) -> None:
     from .export import WebAssignRoster, WebAssignScores
 

@@ -7,7 +7,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import platformdirs
 from dotenv import load_dotenv
@@ -16,6 +16,15 @@ from playwright.sync_api import BrowserContext, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from edubag.clients import LMSClient
+
+from .questions import (
+    WebAssignQuestion,
+    parse_assignment_editor,
+    parse_assignment_list,
+    parse_question_editor,
+    redact,
+    user_pass,
+)
 
 
 def _run_sync_in_thread[T](func: Callable[..., T], *args, **kwargs) -> T:
@@ -89,6 +98,12 @@ SYNC_MESSAGES = {
 }
 SYNC_ERROR_MESSAGE = "An error occurred while sending the scores to the LMS"
 
+# Friendly names for the class overview's assignment list filter.
+ASSIGNMENT_DATES = {"all": "all", "past": "past", "current": "current", "future": "future"}
+# Editor pages, fetched with plain GETs so that none of their scripts run.
+ASSIGNMENT_EDIT_PATH = "/v4cgi/faculty.pl?action=assignments/edit&aid={aid}"
+QUESTION_EDIT_PATH = "/v4cgi/faculty.pl?action=questions/edit&qid={qid}"
+
 
 def file_type_value(file_type: str) -> str:
     """Map a friendly file type (csv, tsv, excel) to WebAssign's option value."""
@@ -135,12 +150,34 @@ def sync_message(status: int) -> str:
     return SYNC_MESSAGES.get(status, SYNC_ERROR_MESSAGE)
 
 
+def assignment_date_value(when: str) -> str:
+    """Map a friendly assignment list filter (all, past, current, future) to WebAssign's value."""
+    try:
+        return ASSIGNMENT_DATES[when.lower()]
+    except KeyError:
+        raise ValueError(f"Unknown assignment list {when!r}; choose from {', '.join(ASSIGNMENT_DATES)}") from None
+
+
+def assignment_id(assignment: str | int) -> str:
+    """Normalize a WebAssign assignment ID (the ``aid`` in the Assignment Editor's URL)."""
+    value = str(assignment).strip()
+    if not value.isdigit():
+        raise ValueError(f"Invalid WebAssign assignment ID: {assignment!r}")
+    return value
+
+
+def export_dir_name(aid: str, name: str) -> str:
+    """Directory name for an exported assignment, e.g. ``26664464-ECET2e-Chap-8-1``."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-")
+    return f"{aid}-{slug}" if slug else aid
+
+
 class WebAssignClient(LMSClient):
     """Client to interact with the WebAssign platform.
 
     This client provides automated browser-based interactions with Cengage
-    WebAssign for downloading rosters and gradebooks and for syncing scores to
-    the linked LMS.
+    WebAssign for downloading rosters and gradebooks, syncing scores to the
+    linked LMS, and exporting the source of assignments and their questions.
 
     Note on headless parameter:
         Methods that accept `headless` parameter default to:
@@ -555,4 +592,181 @@ class WebAssignClient(LMSClient):
         state: dict = {}
         return self._run_with_reauth(
             lambda: self._sync_scores_session(section, dry_run, headless, state), headless=headless
+        )
+
+    def _list_assignments_session(self, section: str, when: str, headless: bool) -> list[dict[str, str]]:
+        """Internal method to list a section's assignments in a single browser session.
+
+        Raises WebAssignAuthError if authentication has expired.
+        """
+        sid = section_id(section)
+        date = assignment_date_value(when)
+
+        def _do_list() -> list[dict[str, str]]:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    page = context.new_page()
+                    self._open_my_classes(page)
+
+                    # The class's Past | Current/Recent | Future | All links.
+                    link = page.locator(f"a[href*=\"assignmentDate.value='{date}'\"][href*=\",{sid}'\"]")
+                    if link.count() == 0:
+                        raise ValueError(f"Section {sid} is not among the current classes in WebAssign")
+                    with page.expect_navigation():
+                        link.first.click()
+                    rows = parse_assignment_list(page.content())
+                    return [row for row in rows if row["section_id"] in ("", sid)]
+                finally:
+                    browser.close()
+
+        return _run_sync_in_thread(_do_list)
+
+    def list_assignments(self, section: str, when: str = "all", headless: bool = True) -> list[dict[str, str]]:
+        """List a section's assignments.
+
+        Args:
+            section (str): WebAssign section ID (see `list_sections`).
+            when (str): "all", "past", "current" or "future".
+            headless (bool): Whether to run the browser in headless mode.
+
+        Returns:
+            list[dict[str, str]]: One dict per assignment with keys ``aid``,
+            ``name``, ``deployment_id``, ``course_id``, ``section_id`` and ``due``.
+        """
+        assignment_date_value(when)
+        return self._run_with_reauth(
+            lambda: self._list_assignments_session(section, when, headless), headless=headless
+        )
+
+    def _fetch_page(self, context: BrowserContext, path: str) -> str:
+        """GET a WebAssign page with the session's cookies, without running its scripts.
+
+        Raises WebAssignAuthError if the request lands outside a signed-in page.
+        """
+        response = context.request.get(urljoin(self.base_url, path))
+        if not self._is_signed_in_url(response.url):
+            raise WebAssignAuthError("WebAssign session has expired.")
+        if not response.ok:
+            raise RuntimeError(f"WebAssign returned HTTP {response.status} for {path}")
+        return response.text()
+
+    def _download_image(self, context: BrowserContext, src: str, target_dir: Path) -> Path | None:
+        """Download an image named in question source; None if it is elsewhere or unavailable."""
+        url = urljoin(self.base_url, src)
+        if urlparse(url).netloc != urlparse(self.base_url).netloc:
+            return None
+        response = context.request.get(url)
+        if not response.ok:
+            logger.warning(f"Could not download image {src}: HTTP {response.status}")
+            return None
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / Path(urlparse(url).path).name
+        path.write_bytes(response.body())
+        return path
+
+    def _export_question(
+        self, context: BrowserContext, qid: str, out: Path, secret: str | None, keep_html: bool
+    ) -> WebAssignQuestion:
+        """Fetch and parse one question's editor page, downloading its images."""
+        path = QUESTION_EDIT_PATH.format(qid=qid)
+        html = self._fetch_page(context, f"{path}&UserPass={secret}" if secret else path)
+        if keep_html:
+            html_path = out / "html" / f"question-{qid}.html"
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(redact(html, secret), encoding="utf-8")
+        question = parse_question_editor(html)
+        question.source_url = urljoin(self.base_url, path)
+        for image in question.images:
+            saved = self._download_image(context, image["src"], out / "questions" / qid)
+            image["file"] = saved.relative_to(out).as_posix() if saved else None
+        return question
+
+    def _export_assignment_session(
+        self, aid: str, save_dir: Path | None, overwrite: bool, keep_html: bool, delay: float, headless: bool
+    ) -> Path:
+        """Internal method to export an assignment in a single browser session.
+
+        Raises WebAssignAuthError if authentication has expired.
+        """
+
+        def _do_export() -> Path:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    page = context.new_page()
+                    self._open_my_classes(page)
+                    secret = user_pass(page.url)
+
+                    path = ASSIGNMENT_EDIT_PATH.format(aid=aid)
+                    html = self._fetch_page(context, path)
+                    assignment = parse_assignment_editor(html)
+                    assignment.source_url = urljoin(self.base_url, path)
+                    out = (save_dir or Path.cwd()) / export_dir_name(aid, assignment.name)
+                    if keep_html:
+                        html_path = out / "html" / f"assignment-{aid}.html"
+                        html_path.parent.mkdir(parents=True, exist_ok=True)
+                        html_path.write_text(redact(html, secret), encoding="utf-8")
+
+                    for entry in assignment.questions:
+                        qid = entry["qid"]
+                        entry["file"] = f"questions/{qid}.json"
+                        target = out / entry["file"]
+                        if target.exists() and not overwrite:
+                            logger.info(f"Skipping question {qid}: {target} already exists")
+                            continue
+                        try:
+                            question = self._export_question(context, qid, out, secret, keep_html)
+                        except WebAssignAuthError:
+                            raise
+                        except Exception as e:
+                            logger.warning(f"Could not export question {qid}: {e}")
+                            assignment.errors.append({"qid": qid, "error": str(e)})
+                            continue
+                        question.to_json(target)
+                        logger.info(f"Saved question {qid} ({question.name}) to {target}")
+                        time.sleep(delay)
+
+                    assignment.to_json(out / "assignment.json")
+                    logger.info(f"Saved assignment {aid} ({assignment.name}) to {out}")
+                    return out
+                finally:
+                    browser.close()
+
+        return _run_sync_in_thread(_do_export)
+
+    def export_assignment(
+        self,
+        assignment: str,
+        save_dir: Path | None = None,
+        overwrite: bool = False,
+        keep_html: bool = False,
+        delay: float = 1.0,
+        headless: bool = True,
+    ) -> Path:
+        """Export an assignment and the source of its questions as JSON.
+
+        Reads the Assignment Editor and each question's Question Editor, and
+        never saves either. Writes ``assignment.json`` (settings and the ordered
+        question list) and ``questions/<qid>.json`` (the Question, Answer and
+        Solution source verbatim, mode, and textbook/author information), plus
+        any images the source names, into ``<save_dir>/<aid>-<name>/``.
+
+        Args:
+            assignment (str): WebAssign assignment ID (``aid``; see `list_assignments`).
+            save_dir (Path | None): Parent directory for the export. Defaults to the current directory.
+            overwrite (bool): Re-export questions already saved in the export directory.
+            keep_html (bool): Also save the editor pages' HTML under ``html/``.
+            delay (float): Seconds to wait between questions.
+            headless (bool): Whether to run the browser in headless mode.
+
+        Returns:
+            Path: The export directory.
+        """
+        aid = assignment_id(assignment)
+        return self._run_with_reauth(
+            lambda: self._export_assignment_session(aid, save_dir, overwrite, keep_html, delay, headless),
+            headless=headless,
         )
