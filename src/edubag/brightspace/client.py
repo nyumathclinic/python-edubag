@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar
+from urllib.parse import urljoin, urlparse
 
 import platformdirs
 from loguru import logger
@@ -16,7 +17,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from edubag.brightspace import manage_grades
+from edubag.brightspace import manage_grades, quizzes
 from edubag.clients import LMSClient
 
 T = TypeVar("T")
@@ -1008,6 +1009,250 @@ class BrightspaceClient(LMSClient):
         results: dict[int, dict] = {}
         self._run_with_reauth(
             lambda: self._set_start_dates_session(course, schedule, results, headless, dry_run),
+            headless=headless,
+        )
+        return results
+
+    def _open_course_home(self, page, course: str) -> None:
+        """Load a course home page so API calls carry a live session.
+
+        Raises RuntimeError if authentication has expired. An expired session
+        can end up on the SSO page rather than a Brightspace login page, and
+        the Valence API then answers with empty lists instead of an error, so
+        check the host as well.
+        """
+        page.goto(f"{self.base_url}d2l/home/{course}", wait_until="domcontentloaded")
+        if "login" in page.url or urlparse(page.url).netloc != urlparse(self.base_url).netloc:
+            logger.error("Authentication session expired. Please re-authenticate.")
+            raise RuntimeError("Authentication session expired.")
+
+    def _fetch_quiz_list(self, page, course: str) -> list[dict]:
+        """All quizzes in a course from the Valence API, following ``Next`` pages."""
+        pages = []
+        url = quizzes.quiz_list_url(self.base_url, course)
+        while url:
+            response = page.request.get(url)
+            if not response.ok:
+                raise PlaywrightError(f"Quiz list request failed ({response.status}): {url}")
+            pages.append(json.loads(quizzes.strip_xssi(response.text())))
+            url = pages[-1].get("Next")
+        return quizzes.parse_quiz_list(pages)
+
+    def _list_quizzes_session(self, course: str, headless: bool = True) -> list[dict]:
+        """Internal method to list quizzes in a single browser session.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do_list_quizzes():
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                page = context.new_page()
+                try:
+                    self._open_course_home(page, course)
+                    return self._fetch_quiz_list(page, course)
+                finally:
+                    browser.close()
+
+        return _run_sync_in_thread(_do_list_quizzes)
+
+    def list_quizzes(self, course: str, headless: bool = True) -> list[dict]:
+        """List the quizzes in a course.
+
+        Args:
+          * course: The course org unit ID (``ou``)
+          * headless: Whether to run the browser in headless mode
+
+        Returns:
+            list[dict]: Per quiz: id, name, is_active, and start, due and end
+            dates (UTC ISO strings, or None).
+        """
+        return self._run_with_reauth(
+            lambda: self._list_quizzes_session(course, headless),
+            headless=headless,
+        )
+
+    def _export_alert_ids(self, page, course: str) -> set[str]:
+        """``tempFileId`` of every export notification currently in the alert feed."""
+        response = page.request.get(quizzes.alerts_url(self.base_url, course))
+        return {a["temp_file_id"] for a in quizzes.parse_export_alerts(response.text())}
+
+    def _export_quiz_report(
+        self,
+        page,
+        course: str,
+        quiz: dict,
+        report: dict,
+        path: Path,
+        excel: bool = True,
+        all_attempts: bool = False,
+        timeout_s: float = 300,
+    ) -> None:
+        """Export one report and save the file to ``path``.
+
+        Queues the export, waits for its "Export finished" notification, then
+        follows the notification to the file (see ``quizzes``).
+        """
+        build = page.request.get(quizzes.report_build_url(self.base_url, course, quiz["id"], report["id"]))
+        report_type_id = quizzes.parse_report_type_id(build.text())
+        if report_type_id is None:
+            raise PlaywrightError(f"No report type on the View Report page for {report['name']}")
+
+        # Notifications already in the feed belong to earlier exports.
+        seen = self._export_alert_ids(page, course)
+        export_url = quizzes.report_export_url(
+            self.base_url, course, quiz["id"], report["id"], report_type_id, excel, all_attempts
+        )
+        response = page.request.get(export_url)
+        if not response.ok:
+            raise PlaywrightError(f"Export request failed ({response.status}): {export_url}")
+
+        if report.get("type"):
+            expected = quizzes.export_filename(quiz["name"], report["type"], excel)
+            matches = lambda name: name == expected  # noqa: E731
+        else:
+            expected = f"{quiz['name']} - ..."
+            matches = lambda name: name.startswith(f"{quiz['name']} - ")  # noqa: E731
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            alerts = quizzes.parse_export_alerts(page.request.get(quizzes.alerts_url(self.base_url, course)).text())
+            alert = next(
+                (a for a in alerts if a["temp_file_id"] not in seen and a["filename"] and matches(a["filename"])),
+                None,
+            )
+            if alert is not None:
+                break
+            if time.monotonic() > deadline:
+                raise PlaywrightTimeoutError(f"No export notification for {expected} after {timeout_s:.0f}s")
+            page.wait_for_timeout(3000)
+
+        if not alert["success"]:
+            raise PlaywrightError(f"Brightspace reported a failed export of {alert['filename']}")
+        summary = page.request.get(urljoin(self.base_url, alert["href"]))
+        file_href = quizzes.parse_export_file_url(summary.text())
+        if file_href is None:
+            raise PlaywrightError(f"No download link on the export summary for {alert['filename']}")
+        download = page.request.get(urljoin(self.base_url, file_href), timeout=0)
+        if not download.ok:
+            raise PlaywrightError(f"Download failed ({download.status}) for {alert['filename']}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(download.body())
+
+    def _save_quiz_reports_session(
+        self,
+        course: str,
+        quiz_ids: Sequence[str] | None,
+        reports: Sequence[str],
+        save_dir: Path | None,
+        results: list[dict],
+        headless: bool = True,
+        excel: bool = True,
+        all_attempts: bool = False,
+    ) -> None:
+        """Internal method to export quiz reports in a single browser session.
+
+        Appends one entry per report to ``results`` and skips reports already
+        saved there, so a retry after re-authentication picks up where it left off.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do_save_quiz_reports():
+            done = {(r["quiz_id"], r["report_id"]) for r in results if r["status"] == "saved"}
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                page = context.new_page()
+                try:
+                    self._open_course_home(page, course)
+                    quiz_list = self._fetch_quiz_list(page, course)
+                    if quiz_ids is not None:
+                        wanted = {str(q) for q in quiz_ids}
+                        missing = wanted - {q["id"] for q in quiz_list}
+                        if missing:
+                            raise ValueError(f"Not quizzes in course {course}: {sorted(missing)}")
+                        quiz_list = [q for q in quiz_list if q["id"] in wanted]
+
+                    for position, quiz in enumerate(quiz_list, start=1):
+                        html = page.request.get(quizzes.report_list_url(self.base_url, course, quiz["id"])).text()
+                        quiz_reports = quizzes.parse_report_list(html)
+                        selected = [r for r in quiz_reports if quizzes.report_matches(r, reports)]
+                        logger.info(f"[{position}/{len(quiz_list)}] {quiz['name']}: {len(selected)} report(s)")
+                        type_counts = {}
+                        for r in quiz_reports:
+                            type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
+
+                        for report in selected:
+                            if (quiz["id"], report["id"]) in done:
+                                continue
+                            # Name files as Brightspace does, unless two of the
+                            # quiz's reports share a type and would collide.
+                            if report["type"] and type_counts[report["type"]] == 1:
+                                filename = quizzes.export_filename(quiz["name"], report["type"], excel)
+                            else:
+                                filename = quizzes.export_filename(quiz["name"], report["name"], excel)
+                            path = (save_dir or Path()) / quizzes.safe_filename(filename)
+                            entry = {
+                                "quiz_id": quiz["id"],
+                                "quiz_name": quiz["name"],
+                                "report_id": report["id"],
+                                "report": report["name"],
+                                "report_type": report["type"],
+                                "path": None,
+                            }
+                            try:
+                                self._export_quiz_report(page, course, quiz, report, path, excel, all_attempts)
+                            except PlaywrightError as e:
+                                logger.error(f"Failed to export {report['name']} for {quiz['name']}: {e}")
+                                results.append({**entry, "status": "failed", "error": str(e)})
+                                continue
+                            logger.info(f"Saved {report['name']} to {path}")
+                            results[:] = [
+                                r for r in results if (r["quiz_id"], r["report_id"]) != (quiz["id"], report["id"])
+                            ]
+                            results.append({**entry, "path": path, "status": "saved"})
+                            done.add((quiz["id"], report["id"]))
+                finally:
+                    browser.close()
+
+        return _run_sync_in_thread(_do_save_quiz_reports)
+
+    def save_quiz_reports(
+        self,
+        course: str,
+        quiz_ids: Sequence[str] | None = None,
+        reports: Sequence[str] = (),
+        save_dir: Path | None = None,
+        headless: bool = True,
+        excel: bool = True,
+        all_attempts: bool = False,
+    ) -> list[dict]:
+        """Export quiz reports and save them to disk.
+
+        Skips the View Reports / Generate Excel / notification dialog clicks:
+        each export is queued, its notification polled for, and the file
+        fetched directly. A failure on one report is recorded and the
+        remaining reports are still processed.
+
+        Args:
+          * course: The course org unit ID (``ou``)
+          * quiz_ids: Quiz IDs to export (default: every quiz in the course)
+          * reports: Report names or types to export, e.g. "Question Details"
+            (default: every report set up on each quiz)
+          * save_dir: directory to save the files in (default: current working directory)
+          * headless: Whether to run the browser in headless mode
+          * excel: Export Excel (.xlsx) rather than CSV
+          * all_attempts: Include all attempts rather than first attempts only
+
+        Returns:
+            list[dict]: Per report: quiz_id, quiz_name, report_id, report,
+            report_type, path, status ("saved" or "failed") and any error.
+        """
+        results: list[dict] = []
+        self._run_with_reauth(
+            lambda: self._save_quiz_reports_session(
+                course, quiz_ids, reports, save_dir, results, headless, excel, all_attempts
+            ),
             headless=headless,
         )
         return results

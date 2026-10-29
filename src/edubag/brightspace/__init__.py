@@ -852,6 +852,96 @@ def clear_grades(
         raise typer.Exit(code=1)
 
 
+@client_app.command("list-quizzes")
+def list_quizzes(
+    course: Annotated[str, typer.Argument(help="Course ID (ou)")],
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the quiz list as JSON")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """List a course's quizzes with their IDs and due dates."""
+    import json
+
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    quiz_list = client.list_quizzes(course, headless=headless)
+    if as_json:
+        typer.echo(json.dumps(quiz_list, indent=2, ensure_ascii=False))
+        return
+    for q in quiz_list:
+        typer.echo(f"{q['id']}  due {q['due'] or '-':<24}  {q['name']}")
+
+
+@client_app.command("save-quiz-reports")
+def save_quiz_reports(
+    course: Annotated[str, typer.Argument(help="Course ID (ou)")],
+    quiz: Annotated[
+        list[str] | None,
+        typer.Option(help="Only export this quiz ID (repeatable; default: every quiz)"),
+    ] = None,
+    report: Annotated[
+        list[str] | None,
+        typer.Option(help="Only export reports with this name or type (repeatable; default: every report)"),
+    ] = None,
+    save_dir: Annotated[
+        Path | None, typer.Option(help="Directory to save the report files")
+    ] = None,
+    excel: Annotated[
+        bool, typer.Option("--excel/--csv", help="Export Excel (.xlsx) or CSV files")
+    ] = True,
+    all_attempts: Annotated[
+        bool, typer.Option(help="Include all attempts, not just first attempts")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Export quiz reports (e.g. Question Details, User Attempts) to files.
+
+    Example:
+        python -m edubag brightspace client save-quiz-reports 611388 --quiz 519757 --report "User Attempts"
+    """
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        results = client.save_quiz_reports(
+            course,
+            quiz_ids=quiz,
+            reports=report or (),
+            save_dir=save_dir,
+            headless=headless,
+            excel=excel,
+            all_attempts=all_attempts,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    for r in results:
+        typer.echo(r["path"] if r["status"] == "saved" else f"failed  {r['quiz_name']} - {r['report']}: {r['error']}")
+    if any(r["status"] == "failed" for r in results):
+        raise typer.Exit(code=1)
+
+
 # Register the brightspace app as a subcommand with the main app
 main_app.add_typer(app, name="brightspace")
 app.add_typer(client_app, name="client")
