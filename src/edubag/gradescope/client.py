@@ -22,6 +22,17 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from edubag.albert.term import Term
 from edubag.clients import LMSClient
+from edubag.gradescope.setup import (
+    ExamConfig,
+    assignments_titled,
+    container_of,
+    create_exam_assignment,
+    create_version_set,
+    import_assignment_rubric,
+    outline_from_page,
+    read_outline_page,
+    save_outline,
+)
 
 T = TypeVar("T")
 
@@ -1827,6 +1838,185 @@ class GradescopeClient(LMSClient):
                     browser.close()
 
         return _run_sync_in_thread(_do)
+
+    def setup_exam(
+        self,
+        config: ExamConfig,
+        replace_rubrics: bool = False,
+        dry_run: bool = False,
+        headless: bool = True,
+    ) -> dict:
+        """Create a multi-version exam: assignments, outlines, rubrics and version set.
+
+        For each version, in order: create its Exam/Quiz assignment from its
+        PDF (if no assignment has its title), save its outline (if it has
+        none), and import its rubric (questions whose rubric already matches
+        are left alone). Then group the versions into a version set titled
+        ``config.title`` (if they are not grouped already). A step whose file
+        the config does not name is skipped, so a run that stops partway can
+        be repeated.
+
+        Args:
+            config: The exam, from ``load_exam_config``.
+            replace_rubrics: Replace a question's rubric that differs from the file.
+            dry_run: Report what would change, but send nothing.
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            dict: ``versions``, a list with each version's ``version``,
+                ``title``, ``assignment`` (None if not created yet), ``log``
+                (a line per step) and ``rubric`` (the result of
+                ``import_assignment_rubric``, if run); and ``version_set``,
+                a line about the grouping.
+
+        Raises:
+            RuntimeError: If authentication has expired or a request fails.
+            LookupError: If a title matches more than one assignment, or an
+                assignment is missing and the config names no PDF for it.
+            ValueError: If an outline or rubric does not fit its assignment.
+        """
+        course = config.course
+
+        def _assignments(page: Page) -> list[dict]:
+            page.goto(f"{self._course_url(course)}/assignments")
+            page.wait_for_load_state("networkidle")
+            if "login" in page.url:
+                raise RuntimeError("Authentication session expired. Please re-authenticate.")
+            return self._read_assignments_table(page)
+
+        def _do() -> dict:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    if dry_run:
+                        # A dry run must not change anything.
+                        context.route(
+                            "**/*",
+                            lambda route: route.continue_()
+                            if route.request.method in ("GET", "HEAD")
+                            else route.abort(),
+                        )
+                    page = context.new_page()
+                    table_data = _assignments(page)
+
+                    # Look every assignment up before changing anything.
+                    results = []
+                    for v in config.versions:
+                        ids = (
+                            [v.assignment] if v.assignment.isdigit() else assignments_titled(table_data, v.assignment)
+                        )
+                        if len(ids) > 1:
+                            raise LookupError(
+                                f"More than one assignment is titled '{v.assignment}' (IDs {', '.join(ids)})"
+                            )
+                        if not ids and v.pdf is None:
+                            raise LookupError(f"No assignment titled '{v.assignment}', and no pdf to create it from")
+                        results.append({
+                            "version": v.name,
+                            "title": v.assignment,
+                            "assignment": ids[0] if ids else None,
+                            "log": [],
+                            "rubric": None,
+                        })
+
+                    for v, result in zip(config.versions, results, strict=True):
+                        log = result["log"]
+                        if result["assignment"] is None:
+                            if dry_run:
+                                log.append(f"would create it from {v.pdf.name}, then add its outline and rubric")
+                                continue
+                            result["assignment"] = create_exam_assignment(
+                                page, self.base_url, course, v.assignment, v.pdf
+                            )
+                            log.append(f"created it from {v.pdf.name}")
+                        assignment = result["assignment"]
+
+                        if v.outline is not None:
+                            outline = json.loads(v.outline.read_text())
+                            if dry_run:
+                                saved = read_outline_page(page, self.base_url, course, assignment).get("outline")
+                                if saved:
+                                    log.append("outline already saved")
+                                else:
+                                    log.append(f"would save the outline from {v.outline.name}")
+                                if not saved:
+                                    if v.rubric is not None:
+                                        log.append("would import the rubric after the outline")
+                                    continue
+                            elif save_outline(page, self.base_url, course, assignment, outline):
+                                log.append(f"saved the outline from {v.outline.name}")
+                            else:
+                                log.append("outline already saved; left alone")
+
+                        if v.rubric is not None:
+                            data = json.loads(v.rubric.read_text())
+                            result["rubric"] = import_assignment_rubric(
+                                page, self.base_url, course, assignment, data, replace_rubrics, dry_run
+                            )
+
+                    ids = [r["assignment"] for r in results]
+                    if None not in ids:
+                        table_data = _assignments(page)
+                    containers = {container_of(table_data, a) if a else None for a in ids}
+                    if containers == {None}:
+                        if dry_run:
+                            version_set = f"would group the versions into a version set titled '{config.title}'"
+                        else:
+                            create_version_set(page, course, config.title, ids)
+                            version_set = f"grouped the versions into a version set titled '{config.title}'"
+                    elif len(containers) == 1:
+                        version_set = f"already grouped in version set {containers.pop()}"
+                    else:
+                        raise RuntimeError(
+                            "Some versions are already in a version set and some are not, or in different ones; "
+                            "group them by hand on the Assignments page"
+                        )
+                    return {"versions": results, "version_set": version_set}
+                finally:
+                    browser.close()
+
+        return self._with_reauth(lambda: _run_sync_in_thread(_do), headless)
+
+    def export_outline(self, course: str, assignment: str, headless: bool = True) -> dict:
+        """An assignment's saved outline, as an outline file for ``setup_exam``.
+
+        Args:
+            course: Gradescope course ID.
+            assignment: Gradescope assignment ID, or the assignment's title
+                (matched ignoring case; it must be unique in the course).
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            dict: ``identification_regions`` and ``question_data``; see
+                ``edubag.gradescope.setup``.
+
+        Raises:
+            RuntimeError: If authentication has expired or the assignment has no outline.
+            LookupError: If no assignment, or more than one, has the given title.
+        """
+
+        def _do() -> dict:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    page = context.new_page()
+                    assignment_id = assignment
+                    if not assignment.isdigit():
+                        page.goto(f"{self._course_url(course)}/assignments")
+                        page.wait_for_load_state("networkidle")
+                        if "login" in page.url:
+                            raise RuntimeError("Authentication session expired. Please re-authenticate.")
+                        assignment_id = find_assignment_id(self._read_assignments_table(page), assignment)
+                    props = read_outline_page(page, self.base_url, course, assignment_id)
+                    if not props.get("outline"):
+                        raise RuntimeError(f"Assignment {assignment_id} has no saved outline")
+                    return outline_from_page(props)
+                finally:
+                    browser.close()
+
+        return self._with_reauth(lambda: _run_sync_in_thread(_do), headless)
 
     def _scans_url(self, course: str, assignment: str, container: bool) -> str:
         """URL of the Manage Scans page of an assignment, or of a version set's container."""

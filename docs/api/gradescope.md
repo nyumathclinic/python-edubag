@@ -12,6 +12,8 @@ Gradescope assessment platform integration.
 
 ::: edubag.gradescope.scan
 
+::: edubag.gradescope.setup
+
 ::: edubag.gradescope.scoresheet
 
 ::: edubag.gradescope.pdfutils

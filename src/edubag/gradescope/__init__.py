@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Annotated, List
 
@@ -15,6 +16,7 @@ from edubag.gradescope.scoresheet import (
 )
 
 from .client import REGION_WARNING, GradescopeClient
+from .setup import load_exam_config, outline_indexes
 
 # Create a local Typer app for gradescope subcommands
 app = typer.Typer(help="Gradescope management commands")
@@ -796,6 +798,128 @@ def replace_pdf(
     typer.echo(f"Replaced the PDF of {label} with {pdf_path.name} and saved the outline.")
     if result["regions_need_review"]:
         typer.echo(f"Warning: {REGION_WARNING}: {result['outline_url']}")
+
+
+@client_app.command("setup-exam")
+def setup_exam(
+    config_path: Annotated[
+        Path,
+        typer.Argument(help="The exam's YAML config file", exists=True, dir_okay=False, readable=True),
+    ],
+    replace_rubrics: Annotated[
+        bool,
+        typer.Option("--replace-rubrics", help="Replace question rubrics that differ from the files"),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report what would change, but send nothing")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Create a multi-version exam: assignments, outlines, rubrics, version set.
+
+    The config names the course, the exam title and each version's files:
+
+    \b
+        course: 1234567
+        title: Quiz 6
+        outline: outline-q06.json
+        versions:
+          "0930": {pdf: q06-0930.qns.pdf, rubric: rubric-q06-0930.json}
+          "1100": {pdf: q06-1100.qns.pdf, rubric: rubric-q06-1100.json}
+
+    Version 0930's assignment is "Quiz 6 - 0930" unless the version gives
+    "assignment" (an ID or title), or the config gives "title_format". The
+    top-level outline is used by versions that do not name their own.
+
+    Every step is skipped if already done: an assignment with the title is not
+    created again, a saved outline is kept, questions whose rubric matches the
+    file are left alone, and grouped versions stay grouped. So a run that
+    stops partway can simply be repeated.
+    """
+    try:
+        config = load_exam_config(config_path)
+    except ValueError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        results = client.setup_exam(config, replace_rubrics=replace_rubrics, dry_run=dry_run, headless=headless)
+    except Exception as e:
+        typer.echo(f"Failed to set up '{config.title}': {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    conflicts = False
+    for result in results["versions"]:
+        assignment = f"assignment {result['assignment']}" if result["assignment"] else "not created yet"
+        typer.echo(f"{result['title']} ({assignment}):")
+        for line in result["log"]:
+            typer.echo(f"  {line}")
+        if result["rubric"] is None:
+            continue
+        for warning in result["rubric"]["warnings"]:
+            typer.echo(f"  warning: {warning}")
+        for q in result["rubric"]["questions"]:
+            if q["status"] == "conflict":
+                conflicts = True
+                typer.echo(f"  {q['question']}: has a different rubric; left alone")
+            elif q["status"] == "unchanged":
+                typer.echo(f"  {q['question']}: rubric already matches")
+            else:
+                typer.echo(f"  {q['question']}: " + ("would import" if dry_run else "imported")
+                           + f" ({len(q['changes'])} change(s))")
+    typer.echo(results["version_set"][0].upper() + results["version_set"][1:] + ".")
+    if conflicts:
+        typer.echo("Run again with --replace-rubrics to replace the rubrics marked 'left alone'.")
+
+
+@client_app.command("export-outline")
+def export_outline(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    assignment: Annotated[
+        str, typer.Argument(help="Gradescope assignment ID, or its title (e.g. 'Quiz 5 9:30 a.m. edition')")
+    ],
+    output: Annotated[Path, typer.Argument(help="The outline JSON file to write", dir_okay=False)],
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Gradescope base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Save an assignment's outline as an outline file for setup-exam.
+
+    The file holds the name and ID regions and each question's title, points
+    and regions, as percentages of the page.
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        outline = client.export_outline(course, assignment, headless=headless)
+    except Exception as e:
+        typer.echo(f"Failed to export the outline of '{assignment}': {e}", err=True)
+        raise typer.Exit(code=1) from e
+    output.write_text(json.dumps(outline, indent=2) + "\n")
+    count = len(outline_indexes(outline["question_data"]))
+    typer.echo(f"Saved the outline of '{assignment}' ({count} questions) to {output}")
 
 
 # Register the gradescope app as a subcommand with the main app
