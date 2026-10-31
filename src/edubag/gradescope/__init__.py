@@ -843,6 +843,9 @@ def setup_exam(
     "assignment" (an ID or title), or the config gives "title_format". The
     top-level outline is used by versions that do not name their own.
 
+    "student_visibility: applied" sets every version's Student visibility to
+    "Show applied rubric items only" (also: all, by_scoring, hidden).
+
     Every step is skipped if already done: an assignment with the title is not
     created again, a saved outline is kept, questions whose rubric matches the
     file are left alone, and grouped versions stay grouped. So a run that

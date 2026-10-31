@@ -97,6 +97,18 @@ class TestLoadExamConfig:
         with pytest.raises(ValueError, match="rubric file not found"):
             load_exam_config(config_path)
 
+    def test_student_visibility(self, tmp_path):
+        config_path = tmp_path / "gradescope.yml"
+        config_path.write_text("course: 1\ntitle: Quiz 6\nversions: {A: {}}\n")
+        assert load_exam_config(config_path).student_visibility is None
+
+        config_path.write_text("course: 1\ntitle: Quiz 6\nstudent_visibility: applied\nversions: {A: {}}\n")
+        assert load_exam_config(config_path).student_visibility == "applied"
+
+        config_path.write_text("course: 1\ntitle: Quiz 6\nstudent_visibility: some\nversions: {A: {}}\n")
+        with pytest.raises(ValueError, match="'student_visibility' must be one of all, applied"):
+            load_exam_config(config_path)
+
 
 class TestNormalizeRubric:
     def test_entries_follow_positions(self):

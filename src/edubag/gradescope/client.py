@@ -31,7 +31,9 @@ from edubag.gradescope.setup import (
     import_assignment_rubric,
     outline_from_page,
     read_outline_page,
+    read_student_visibility,
     save_outline,
+    set_student_visibility,
 )
 
 T = TypeVar("T")
@@ -1850,8 +1852,9 @@ class GradescopeClient(LMSClient):
 
         For each version, in order: create its Exam/Quiz assignment from its
         PDF (if no assignment has its title), save its outline (if it has
-        none), and import its rubric (questions whose rubric already matches
-        are left alone). Then group the versions into a version set titled
+        none), import its rubric (questions whose rubric already matches
+        are left alone), and set its student visibility (if the config gives
+        one). Then group the versions into a version set titled
         ``config.title`` (if they are not grouped already). A step whose file
         the config does not name is skipped, so a run that stops partway can
         be repeated.
@@ -1920,11 +1923,14 @@ class GradescopeClient(LMSClient):
                             "rubric": None,
                         })
 
+                    visibility = config.student_visibility
                     for v, result in zip(config.versions, results, strict=True):
                         log = result["log"]
                         if result["assignment"] is None:
                             if dry_run:
                                 log.append(f"would create it from {v.pdf.name}, then add its outline and rubric")
+                                if visibility:
+                                    log.append(f"would set student visibility to {visibility}")
                                 continue
                             result["assignment"] = create_exam_assignment(
                                 page, self.base_url, course, v.assignment, v.pdf
@@ -1943,6 +1949,8 @@ class GradescopeClient(LMSClient):
                                 if not saved:
                                     if v.rubric is not None:
                                         log.append("would import the rubric after the outline")
+                                    if visibility:
+                                        log.append(f"would set student visibility to {visibility}")
                                     continue
                             elif save_outline(page, self.base_url, course, assignment, outline):
                                 log.append(f"saved the outline from {v.outline.name}")
@@ -1954,6 +1962,17 @@ class GradescopeClient(LMSClient):
                             result["rubric"] = import_assignment_rubric(
                                 page, self.base_url, course, assignment, data, replace_rubrics, dry_run
                             )
+
+                        if visibility:
+                            if dry_run:
+                                current = read_student_visibility(page, self.base_url, course, assignment)
+                                changed = current != visibility
+                            else:
+                                changed = set_student_visibility(page, self.base_url, course, assignment, visibility)
+                            if not changed:
+                                log.append(f"student visibility already {visibility}")
+                            else:
+                                log.append(("would set" if dry_run else "set") + f" student visibility to {visibility}")
 
                     ids = [r["assignment"] for r in results]
                     if None not in ids:

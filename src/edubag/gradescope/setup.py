@@ -30,6 +30,16 @@ exam-gradescope writes next to its PDF, if they are there: for
       "0930": {pdf: q06-0930.qns.pdf}
       "1100": {pdf: q06-1100.qns.pdf}
 
+The config may also set every version's "Student visibility" setting, which
+rubric items students see on their graded work::
+
+    student_visibility: applied
+
+The values are ``all`` (show all rubric items), ``applied`` (show applied
+rubric items only), ``by_scoring`` (all items for positive scoring, applied
+items for negative scoring) and ``hidden`` (hide all rubric items). Without
+it, the setting is left alone.
+
 An outline file is the body Gradescope's outline editor sends, without the
 ``assignment`` wrapper. Coordinates are percentages of the page, measured from
 its top left corner::
@@ -66,6 +76,14 @@ SETTINGS_KEYS = ("scoring_type", "floor", "ceiling")
 SCORING_TYPES = ("positive", "negative")
 DEFAULT_TITLE_FORMAT = "{title} - {version}"
 RECT_KEYS = ("page_number", "x1", "x2", "y1", "y2")
+# The config's student_visibility values, and the assignment settings form's
+# values for them (the radios named assignment[rubric_visibility_setting]).
+STUDENT_VISIBILITY = {
+    "all": "show_all_rubric_items",
+    "applied": "show_only_applied_rubric_items",
+    "by_scoring": "show_all_positive_and_negative_rubric_items",
+    "hidden": "hide_all_rubric_items",
+}
 
 
 @dataclass
@@ -86,6 +104,8 @@ class ExamConfig:
     course: str
     title: str
     versions: list[VersionConfig] = field(default_factory=list)
+    # A key of STUDENT_VISIBILITY, or None to leave the setting alone.
+    student_visibility: str | None = None
 
 
 def load_exam_config(path: Path) -> ExamConfig:
@@ -106,6 +126,10 @@ def load_exam_config(path: Path) -> ExamConfig:
         errors.append("'versions' must map each version's name to its files")
     if errors:
         raise ValueError(f"{path}: " + "; ".join(errors))
+
+    visibility = data.get("student_visibility")
+    if visibility is not None and str(visibility) not in STUDENT_VISIBILITY:
+        errors.append(f"'student_visibility' must be one of {', '.join(STUDENT_VISIBILITY)}, not '{visibility}'")
 
     title = str(data["title"])
     title_format = str(data.get("title_format", DEFAULT_TITLE_FORMAT))
@@ -145,7 +169,12 @@ def load_exam_config(path: Path) -> ExamConfig:
         versions.append(VersionConfig(name=name, assignment=assignment, **files))
     if errors:
         raise ValueError(f"{path}: " + "; ".join(errors))
-    return ExamConfig(course=str(data["course"]), title=title, versions=versions)
+    return ExamConfig(
+        course=str(data["course"]),
+        title=title,
+        versions=versions,
+        student_visibility=None if visibility is None else str(visibility),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +649,48 @@ def save_outline(
         {"assignment": {"identification_regions": outline.get("identification_regions") or {}},
          "question_data": outline["question_data"]},
     )
+    return True
+
+
+def _settings_form(page: Page, base_url: str, course: str, assignment: str):
+    page.goto(f"{base_url}/courses/{course}/assignments/{assignment}/edit")
+    page.wait_for_load_state("domcontentloaded")
+    if "login" in page.url:
+        raise RuntimeError("Authentication session expired. Please re-authenticate.")
+    form = page.locator("form#assignment_form")
+    form.wait_for(state="attached", timeout=30000)
+    return form
+
+
+def read_student_visibility(page: Page, base_url: str, course: str, assignment: str) -> str | None:
+    """An assignment's "Student visibility" setting (a key of ``STUDENT_VISIBILITY``)."""
+    form = _settings_form(page, base_url, course, assignment)
+    checked = form.locator("input[name='assignment[rubric_visibility_setting]']:checked")
+    value = checked.get_attribute("value") if checked.count() else None
+    return next((key for key, v in STUDENT_VISIBILITY.items() if v == value), value)
+
+
+def set_student_visibility(page: Page, base_url: str, course: str, assignment: str, value: str) -> bool:
+    """Set an assignment's "Student visibility" setting (a key of ``STUDENT_VISIBILITY``).
+
+    Returns:
+        True if the setting was changed, False if it already had ``value``.
+    """
+    if read_student_visibility(page, base_url, course, assignment) == value:
+        return False
+    radio = f"assignment_rubric_visibility_setting_{STUDENT_VISIBILITY[value]}"
+    # The radios are hidden behind their styled labels, which take the clicks.
+    page.locator(f"label[for='{radio}']").click()
+    if not page.locator(f"#{radio}").is_checked():
+        raise RuntimeError(f"Could not select {value} for the student visibility of assignment {assignment}")
+    # The Save button sits in the action bar, outside the <form> element.
+    with page.expect_response(
+        lambda r: r.request.method != "GET" and f"/assignments/{assignment}" in r.url, timeout=120000
+    ) as response_info:
+        page.get_by_role("button", name="Save Assignment").click()
+    response = response_info.value
+    if not response.ok and response.status not in (301, 302, 303):
+        raise RuntimeError(f"Saving the settings of assignment {assignment} failed: HTTP {response.status}")
     return True
 
 
