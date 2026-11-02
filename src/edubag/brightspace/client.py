@@ -422,8 +422,10 @@ class BrightspaceClient(LMSClient):
                 export_to_csv.scroll_into_view_if_needed()
                 export_to_csv.click()
 
-                with page.expect_download() as download_info:
-                    page.get_by_role("button", name="Download").click()
+                # Download stays disabled while D2L builds the export; large
+                # gradebooks can take well over the default 30s.
+                with page.expect_download(timeout=300000) as download_info:
+                    page.get_by_role("button", name="Download").click(timeout=300000)
                 download = download_info.value
 
                 # Save the download
