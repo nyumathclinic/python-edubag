@@ -142,6 +142,23 @@ class TestGradescopeClient:
                 mock_session.assert_called_once_with("Calculus II", term, True)
                 assert result == []
 
+    def test_fetch_class_details_by_course_ids(self):
+        """course_ids visits courses directly instead of matching by name."""
+        client = GradescopeClient()
+        with patch("pathlib.Path.exists", return_value=True):
+            with patch.object(
+                client, "_fetch_class_details_by_id_session", return_value=[{"course_id": "1"}]
+            ) as by_id, patch.object(client, "_fetch_class_details_session") as by_name:
+                result = client.fetch_class_details(course_ids=["1", "2"], headless=True)
+                by_id.assert_called_once_with(["1", "2"], True)
+                by_name.assert_not_called()
+                assert result == [{"course_id": "1"}]
+
+    def test_fetch_class_details_requires_ids_or_name_and_term(self):
+        client = GradescopeClient()
+        with pytest.raises(ValueError):
+            client.fetch_class_details(course_name="Calculus II")
+
     def test_fetch_class_details_with_output(self):
         """Test that fetch_class_details saves to output file."""
         client = GradescopeClient()

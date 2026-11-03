@@ -326,9 +326,16 @@ def sync_roster(
 @client_app.command("fetch-details")
 def fetch_class_details(
     course_name: Annotated[
-        str, typer.Argument(help="Course name to match in Gradescope")
-    ],
-    term: Annotated[str, typer.Argument(help="Term, e.g., 'Fall 2025'")],
+        str | None, typer.Argument(help="Course name to match in Gradescope")
+    ] = None,
+    term: Annotated[str | None, typer.Argument(help="Term, e.g., 'Fall 2025'")] = None,
+    course_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--course-id",
+            help="Gradescope course ID to visit directly (repeatable); replaces name/term matching",
+        ),
+    ] = None,
     output: Annotated[Path | None, typer.Option(help="Path to save output in")] = None,
     headless: Annotated[
         bool,
@@ -344,15 +351,19 @@ def fetch_class_details(
         Path | None, typer.Option(help="Path to stored auth state JSON")
     ] = None,
 ) -> None:
-    """Fetch class details for a course offering and optionally save."""
+    """Fetch class details by course ID, or by course name and term, and optionally save."""
     import json
 
+    if not course_ids and (course_name is None or term is None):
+        typer.echo("Give --course-id, or both COURSE_NAME and TERM.", err=True)
+        raise typer.Exit(code=2)
     client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
     result = client.fetch_class_details(
         course_name=course_name,
         term=term,
         headless=headless,
         output=output,
+        course_ids=course_ids,
     )
 
     # If output is None, pretty-print to STDOUT

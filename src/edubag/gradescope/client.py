@@ -599,28 +599,77 @@ class GradescopeClient(LMSClient):
 
         return _run_sync_in_thread(_do)
 
+    def _fetch_class_details_by_id_session(
+        self,
+        course_ids: list[str],
+        headless: bool = True,
+    ) -> list[dict]:
+        """Fetch class details by visiting each course page directly.
+
+        Unlike name matching on the dashboard, this is unaffected by course
+        renames. Courses that can't be opened are skipped with a warning.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do() -> list[dict]:
+            result = []
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                page = context.new_page()
+                try:
+                    for course_id in course_ids:
+                        page.goto(f"{self.base_url}/courses/{course_id}")
+                        if "login" in page.url:
+                            raise RuntimeError("Authentication session expired.")
+                        page.wait_for_load_state("networkidle")
+                        if page.locator("div.courseHeader--courseID").count() == 0:
+                            logger.warning(
+                                f"Could not open Gradescope course {course_id} (landed on {page.url}); skipping"
+                            )
+                            continue
+                        course_details = self._extract_course_details(page)
+                        course_details.setdefault("course_id", str(course_id))
+                        result.append(course_details)
+                        logger.info(
+                            f"Extracted details for course {course_id}: "
+                            f"{course_details.get('course_name', 'Unknown')}"
+                        )
+                finally:
+                    browser.close()
+            return result
+
+        return _run_sync_in_thread(_do)
+
     def fetch_class_details(
         self,
-        course_name: str,
-        term: str | Term,
+        course_name: str | None = None,
+        term: str | Term | None = None,
         username: str | None = None,
         password: str | None = None,
         headless: bool = True,
         output: Path | None = None,
+        course_ids: list[str] | None = None,
     ) -> list[dict]:
         """Fetch class details for a course offering and optionally save.
 
+        Courses are found either by ID (``course_ids``, preferred: robust to
+        renames) or by matching ``course_name`` on the dashboard under ``term``.
+
         Args:
-          * course_name (str): The name of the course.
-          * term (str | Term): The term of the course.
+          * course_name (str | None): The name of the course. Ignored if course_ids is given.
+          * term (str | Term | None): The term of the course. Ignored if course_ids is given.
           * username (str | None): NetID to log in with. If None, user must enter manually.
           * password (str | None): Password for login. If None, user must enter manually.
           * headless (bool): Whether to run the browser in headless mode.
           * output (Path | None): Path to save the output JSON. If None, doesn't save.
+          * course_ids (list[str] | None): Gradescope course IDs to visit directly.
 
         Returns:
             list[dict]: List of dictionaries with class details.
         """
+        if not course_ids and (course_name is None or term is None):
+            raise ValueError("Pass course_ids, or both course_name and term.")
         # Check if authentication state exists; if not, authenticate first
         if not self.auth_state_path.exists():
             logger.warning(f"Auth state file not found at {self.auth_state_path}. Running authentication...")
@@ -629,7 +678,10 @@ class GradescopeClient(LMSClient):
         max_retries = 1
         for attempt in range(max_retries + 1):
             try:
-                result = self._fetch_class_details_session(course_name, term, headless)
+                if course_ids:
+                    result = self._fetch_class_details_by_id_session(list(course_ids), headless)
+                else:
+                    result = self._fetch_class_details_session(course_name, term, headless)
 
                 # Save to output if specified
                 if output is not None:
