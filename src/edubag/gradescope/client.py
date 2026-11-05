@@ -28,6 +28,9 @@ from edubag.gradescope.setup import (
     container_of,
     create_exam_assignment,
     create_version_set,
+    delete_assignment,
+    delete_assignment_container,
+    find_rows,
     import_assignment_rubric,
     outline_from_page,
     read_outline_page,
@@ -2048,6 +2051,117 @@ class GradescopeClient(LMSClient):
                     browser.close()
 
         return self._with_reauth(lambda: _run_sync_in_thread(_do), headless)
+
+    def _delete_rows(
+        self,
+        course: str,
+        kind: str,
+        wanted: list[str],
+        delete: Callable[[Page, str, str], None],
+        force: bool,
+        dry_run: bool,
+        confirm: Callable[[dict], bool] | None,
+        headless: bool,
+    ) -> dict:
+        """Find rows of the Assignments page (see ``find_rows``) and delete them.
+
+        Anything with submissions is refused unless ``force`` is set, before
+        anything is deleted. ``confirm`` is called with the plan first.
+        """
+
+        def _do() -> dict:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                try:
+                    context = browser.new_context(storage_state=self.auth_state_path)
+                    if dry_run:
+                        # A dry run must not change anything.
+                        context.route(
+                            "**/*",
+                            lambda route: route.continue_()
+                            if route.request.method in ("GET", "HEAD")
+                            else route.abort(),
+                        )
+                    page = context.new_page()
+                    page.goto(f"{self._course_url(course)}/assignments")
+                    page.wait_for_load_state("networkidle")
+                    if "login" in page.url:
+                        raise RuntimeError("Authentication session expired. Please re-authenticate.")
+                    found, missing = find_rows(self._read_assignments_table(page), kind, wanted)
+                    plan = {"found": found, "missing": missing}
+
+                    if not found:
+                        return plan | {"status": "nothing to delete"}
+                    with_work = [f"{r['title']} ({r['id']})" for r in found if r["submissions"]]
+                    if with_work and not force:
+                        raise RuntimeError(
+                            f"{', '.join(with_work)} {'has' if len(with_work) == 1 else 'have'} submissions. "
+                            "Use force to delete anyway."
+                        )
+                    if dry_run:
+                        return plan | {"status": "dry run"}
+                    if confirm is not None and not confirm(plan):
+                        return plan | {"status": "cancelled"}
+                    for r in found:
+                        delete(page, course, r["id"])
+                        logger.info(f"deleted {kind.replace('_', ' ')} {r['id']} ({r['title']})")
+                    return plan | {"status": "deleted"}
+                finally:
+                    browser.close()
+
+        return self._with_reauth(lambda: _run_sync_in_thread(_do), headless)
+
+    def delete_assignments(
+        self,
+        course: str,
+        assignments: list[str],
+        force: bool = False,
+        dry_run: bool = False,
+        confirm: Callable[[dict], bool] | None = None,
+        headless: bool = True,
+    ) -> dict:
+        """Delete assignments of any kind, with their templates, outlines and submissions.
+
+        Args:
+            course: Gradescope course ID.
+            assignments: Assignment IDs or titles (matched ignoring case;
+                each title must be unique in the course).
+            force: Delete even if some assignment has submissions.
+            dry_run: Report what would be deleted, but send nothing.
+            confirm: Called with the plan before anything is deleted;
+                deletion goes ahead only if it returns True.
+            headless: Whether to run the browser in headless mode.
+
+        Returns:
+            dict: ``found`` (``{"id", "title", "submissions"}`` for each),
+                ``missing`` (the IDs or titles not found) and ``status``:
+                "nothing to delete", "dry run", "cancelled" or "deleted".
+
+        Raises:
+            RuntimeError: If authentication has expired, a request fails, or
+                an assignment has submissions and ``force`` is not set.
+            LookupError: If a title matches more than one assignment.
+        """
+        return self._delete_rows(course, "assignment", assignments, delete_assignment,
+                                 force, dry_run, confirm, headless)
+
+    def delete_assignment_containers(
+        self,
+        course: str,
+        containers: list[str],
+        force: bool = False,
+        dry_run: bool = False,
+        confirm: Callable[[dict], bool] | None = None,
+        headless: bool = True,
+    ) -> dict:
+        """Delete assignment containers (version sets). Their assignments are kept, ungrouped.
+
+        Arguments, return value and exceptions are as for ``delete_assignments``,
+        with containers in place of assignments. A container with submissions
+        is refused unless ``force`` is set, although deleting it keeps them.
+        """
+        return self._delete_rows(course, "assignment_container", containers, delete_assignment_container,
+                                 force, dry_run, confirm, headless)
 
     def export_outline(self, course: str, assignment: str, headless: bool = True) -> dict:
         """An assignment's saved outline, as an outline file for ``setup_exam``.

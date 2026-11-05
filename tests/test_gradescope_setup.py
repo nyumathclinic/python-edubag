@@ -12,8 +12,13 @@ from edubag.gradescope.setup import (
     check_outline,
     container_of,
     create_version_set,
+    delete_assignment,
+    delete_assignment_container,
     existing_rubric,
+    find_rows,
+    import_assignment_rubric,
     import_question_rubric,
+    is_default_rubric,
     leaf_questions,
     load_exam_config,
     match_rubric_file,
@@ -22,6 +27,7 @@ from edubag.gradescope.setup import (
     outline_indexes,
     same_rubric,
     save_outline,
+    with_parent_weights,
 )
 
 # A free-response question in the style of a quiz rubric: one ungrouped item
@@ -441,3 +447,217 @@ class TestGeneratedFiles:
         assert a.outline == (tmp_path / "q-A.qns.outline.json").resolve()
         assert a.rubric == (tmp_path / "q-A.qns.rubric.json").resolve()
         assert b.outline == (tmp_path / "other.json").resolve()
+
+
+class TestDefaultRubric:
+    """Gradescope gives every new question one item, "Correct", worth 0."""
+
+    QUESTION = {"id": 40, "full_index": "4", "title": "Q4", "scoring_type": "negative", "floor": True,
+                "ceiling": True}
+    DEFAULT = {"id": 7, "question_id": 40, "description": "Correct", "weight": "0.0"}
+
+    @pytest.mark.parametrize(
+        ("items", "groups", "expected"),
+        [
+            ([DEFAULT], [], True),
+            ([DEFAULT | {"weight": "2.0"}], [], False),
+            ([DEFAULT | {"description": "No response"}], [], False),
+            ([DEFAULT, DEFAULT | {"id": 8}], [], False),
+            ([DEFAULT], [{"id": 1, "description": "Group"}], False),
+        ],
+    )
+    def test_is_default_rubric(self, items, groups, expected):
+        assert is_default_rubric({"rubric_items": items, "rubric_item_groups": groups}) is expected
+
+    def _import(self, items: list[dict]) -> tuple[dict, Mock]:
+        props = {"questions": [self.QUESTION], "rubric_items": items, "rubric_item_groups": []}
+        page = Mock()
+        page.url = "https://gs/courses/1/assignments/2/rubric/edit"
+        created = {"rubric_item_group": {"id": 77}, "rubric_items": [{}, {}]}
+        with (
+            patch.object(gs_setup, "read_rubric_page", return_value=props),
+            patch.object(gs_setup, "send_json", return_value=created) as send,
+        ):
+            result = import_assignment_rubric(page, "https://gs", "1", "2", {"questions": [FRQ]})
+        return result, send
+
+    def test_default_rubric_is_replaced_without_asking(self):
+        result, send = self._import([self.DEFAULT])
+
+        assert result["questions"][0]["status"] == "imported"
+        assert send.call_args_list[0].args[1:] == ("DELETE", "/courses/1/questions/40/rubric_items/7", None)
+
+    def test_other_rubric_is_left_alone(self):
+        result, send = self._import([self.DEFAULT | {"description": "My item", "weight": "1.0"}])
+
+        assert result["questions"][0]["status"] == "conflict"
+        send.assert_not_called()
+
+
+class TestParentWeights:
+    def test_parent_gets_the_sum_of_its_parts(self):
+        questions = [
+            {"title": "Q1", "weight": 10, "crop_rect_list": []},
+            {"title": "Q2", "children": [
+                {"title": "(a)", "weight": 2, "crop_rect_list": []},
+                {"title": "(b)", "children": [{"title": "i", "weight": 1.5}, {"title": "ii", "weight": 1.5}]},
+            ]},
+        ]
+
+        out = with_parent_weights(questions)
+
+        assert out[0] == questions[0]
+        assert out[1]["weight"] == 5
+        assert out[1]["children"][1]["weight"] == 3
+        assert "weight" not in questions[1]  # the input is not changed
+
+    def test_a_given_parent_weight_is_kept(self):
+        questions = [{"title": "Q", "weight": 8, "children": [{"title": "(a)", "weight": 2}]}]
+
+        assert with_parent_weights(questions)[0]["weight"] == 8
+
+    def test_save_outline_sends_parent_weights(self):
+        props = {"outline": [], "template": {"status_string": "processed", "page_count": 2}}
+        rect = OUTLINE["question_data"][0]["crop_rect_list"]
+        outline = OUTLINE | {"question_data": [
+            {"title": "Q", "children": [{"title": "(a)", "weight": 2, "crop_rect_list": rect},
+                                        {"title": "(b)", "weight": 3, "crop_rect_list": rect}]},
+        ]}
+
+        with (
+            patch.object(gs_setup, "read_outline_page", return_value=props),
+            patch.object(gs_setup, "send_json") as send,
+        ):
+            save_outline(Mock(), "https://gs", "1", "2", outline)
+
+        assert send.call_args.args[3]["question_data"][0]["weight"] == 5
+
+
+class TestDelete:
+    TABLE = [
+        {"type": "assignment_container", "title": "Chapter 7 Test", "url": "/courses/1/assignment_containers/430",
+         "num_active_submissions": 0},
+        {"type": "assignment", "title": "Chapter 7 Test - A", "url": "/courses/1/assignments/901",
+         "container_id": 430, "num_active_submissions": 0},
+        {"type": "assignment", "title": "Chapter 7 Test - B", "url": "/courses/1/assignments/902",
+         "container_id": 430, "num_active_submissions": 3},
+        {"type": "assignment", "title": "Problem Set 7", "url": "/courses/1/assignments/800"},
+    ]
+
+    def test_rows_are_found_by_id_or_title(self):
+        found, missing = find_rows(self.TABLE, "assignment", ["chapter 7 test -  a", "902", "800", "999", "901"])
+
+        assert [(r["id"], r["submissions"]) for r in found] == [("901", 0), ("902", 3), ("800", 0)]
+        assert missing == ["999"]
+
+    def test_kinds_are_kept_apart(self):
+        assert find_rows(self.TABLE, "assignment", ["Chapter 7 Test"]) == ([], ["Chapter 7 Test"])
+        found, _ = find_rows(self.TABLE, "assignment_container", ["Chapter 7 Test"])
+        assert found == [{"id": "430", "title": "Chapter 7 Test", "submissions": 0}]
+
+    def test_ambiguous_titles_are_refused(self):
+        table = self.TABLE + [self.TABLE[1] | {"url": "/courses/1/assignments/903"}]
+
+        with pytest.raises(LookupError, match="More than one assignment"):
+            find_rows(table, "assignment", ["Chapter 7 Test - A"])
+
+    def test_requests_match_the_delete_links(self):
+        page = Mock()
+        page.url = "https://www.gradescope.com/courses/1/assignments"
+        page.locator.return_value.first.get_attribute.return_value = "tok"
+        page.request.fetch.return_value.status = 302
+
+        delete_assignment_container(page, "1", "430")
+        delete_assignment(page, "1", "901")
+
+        calls = page.request.fetch.call_args_list
+        assert [c.args[0] for c in calls] == [
+            "https://www.gradescope.com/courses/1/assignment_containers/430",
+            "https://www.gradescope.com/courses/1/assignments/901",
+        ]
+        for c in calls:
+            assert c.kwargs["method"] == "POST"
+            assert c.kwargs["data"] == "_method=delete&authenticity_token=tok"
+            assert c.kwargs["headers"]["X-CSRF-Token"] == "tok"
+            assert c.kwargs["max_redirects"] == 0
+
+    def test_error_response_is_raised(self):
+        page = Mock()
+        page.url = "https://www.gradescope.com/courses/1/assignments"
+        page.request.fetch.return_value.status = 500
+        page.request.fetch.return_value.text.return_value = '{"error":"Internal Server Error"}'
+
+        with pytest.raises(RuntimeError, match="returned 500"):
+            delete_assignment(page, "1", "901")
+
+    def _run(self, tmp_path, method: str, wanted: list[str], **kwargs):
+        from edubag.gradescope import client as gs_client
+
+        client = gs_client.GradescopeClient(base_url="https://gs", auth_state_path=tmp_path / "auth.json")
+        page = Mock()
+        page.url = "https://gs/courses/1/assignments"
+        playwright = Mock()
+        playwright.chromium.launch.return_value.new_context.return_value.new_page.return_value = page
+        with (
+            patch.object(gs_client, "sync_playwright") as sync,
+            patch.object(gs_client.GradescopeClient, "_with_reauth", lambda self, session, headless: session()),
+            patch.object(gs_client.GradescopeClient, "_read_assignments_table", return_value=self.TABLE),
+            patch.object(gs_client, "delete_assignment") as del_assignment,
+            patch.object(gs_client, "delete_assignment_container") as del_container,
+        ):
+            sync.return_value.__enter__.return_value = playwright
+            result = getattr(client, method)("1", wanted, **kwargs)
+        return result, del_assignment, del_container
+
+    def test_submissions_are_refused_without_force(self, tmp_path):
+        with pytest.raises(RuntimeError, match=r"Chapter 7 Test - B \(902\) has submissions"):
+            self._run(tmp_path, "delete_assignments", ["901", "902"])
+
+    def test_dry_run_and_cancel_delete_nothing(self, tmp_path):
+        result, del_assignment, _ = self._run(tmp_path, "delete_assignments", ["901"], dry_run=True)
+        assert result["status"] == "dry run"
+        result, del_assignment, _ = self._run(tmp_path, "delete_assignments", ["901"], confirm=lambda plan: False)
+        assert result["status"] == "cancelled"
+        del_assignment.assert_not_called()
+
+    def test_nothing_found(self, tmp_path):
+        result, del_assignment, _ = self._run(tmp_path, "delete_assignments", ["999"])
+        assert (result["status"], result["missing"]) == ("nothing to delete", ["999"])
+        del_assignment.assert_not_called()
+
+    def test_forced_deletion(self, tmp_path):
+        result, del_assignment, _ = self._run(tmp_path, "delete_assignments", ["901", "902", "999"], force=True,
+                                              confirm=lambda plan: True)
+
+        assert result["status"] == "deleted"
+        assert result["missing"] == ["999"]
+        assert [c.args[1:] for c in del_assignment.call_args_list] == [("1", "901"), ("1", "902")]
+
+    def test_container(self, tmp_path):
+        result, _, del_container = self._run(tmp_path, "delete_assignment_containers", ["Chapter 7 Test"],
+                                             confirm=lambda plan: True)
+
+        assert result["status"] == "deleted"
+        assert del_container.call_args.args[1:] == ("1", "430")
+
+
+class TestOutlineFromNestedPage:
+    def test_children_listed_under_their_parent(self):
+        rect = {"x1": 8.8, "x2": 91.2, "y1": 18.2, "y2": 33.5, "page_number": 17}
+        props = {"outline": [
+            {"id": 1, "type": "FreeResponseQuestion", "parent_id": None, "index": 1, "title": "Question 18",
+             "weight": "10.0", "crop_rect_list": [rect]},
+            {"id": 2, "type": "QuestionGroup", "parent_id": None, "index": 2, "title": "Question 19",
+             "weight": "10.0", "children": [
+                 {"id": 4, "parent_id": 2, "index": 2, "title": "(b)", "weight": "3.0", "crop_rect_list": [rect]},
+                 {"id": 3, "parent_id": 2, "index": 1, "title": "(a)", "weight": "2.0", "crop_rect_list": [rect]},
+             ]},
+        ]}
+
+        outline = outline_from_page(props)
+
+        q19 = outline["question_data"][1]
+        assert [c["title"] for c in q19["children"]] == ["(a)", "(b)"]
+        assert q19["children"][0] == {"title": "(a)", "weight": 2.0, "crop_rect_list": [rect]}
+        assert "crop_rect_list" not in q19
+        assert check_outline(outline) == []

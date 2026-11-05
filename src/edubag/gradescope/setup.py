@@ -228,15 +228,26 @@ def check_outline(outline: Any) -> list[str]:
 def outline_from_page(props: dict) -> dict:
     """An outline file's contents (see the module docstring) from AssignmentOutline page props.
 
-    The page lists saved questions flat, each with its ``parent_id`` and its
-    ``index`` among its siblings; this nests them again.
+    Each saved question has its ``parent_id`` and its ``index`` among its
+    siblings. The page lists subquestions under their parent's ``children``
+    (a parent is a "QuestionGroup"), or in older pages flat beside it; either
+    way they are gathered and nested again by ``parent_id``.
     """
 
     def rect(r: dict) -> dict:
         return {k: r[k] for k in RECT_KEYS}
 
+    def flatten(questions: list[dict]) -> list[dict]:
+        out = []
+        for q in questions or []:
+            out.append(q)
+            out.extend(flatten(q.get("children") or []))
+        return out
+
+    saved = {q["id"]: q for q in flatten(props.get("outline") or [])}.values()
+
     def children_of(parent: Any) -> list[dict]:
-        siblings = sorted((q for q in props.get("outline") or [] if q.get("parent_id") == parent),
+        siblings = sorted((q for q in saved if q.get("parent_id") == parent),
                           key=lambda q: q.get("index") or 0)
         out = []
         for q in siblings:
@@ -482,6 +493,21 @@ def same_rubric(existing: dict, rubric: dict) -> bool:
     return have() == want() and len(groups) == sum("group" in e for e in rubric["entries"])
 
 
+def is_default_rubric(existing: dict) -> bool:
+    """Whether a question's current rubric is the one Gradescope gives a new question.
+
+    That is a single item, "Correct", worth 0, and no groups. Replacing it
+    loses nothing, so it does not count as a rubric of the user's.
+    """
+    items, groups = existing["rubric_items"], existing["rubric_item_groups"]
+    return (
+        not groups
+        and len(items) == 1
+        and items[0].get("description") == "Correct"
+        and float(items[0].get("weight") or 0) == 0
+    )
+
+
 def _weight(value: float) -> str:
     """A weight as Gradescope's rubric editor sends it (like JavaScript's String(number))."""
     return str(int(value)) if float(value).is_integer() else repr(float(value))
@@ -541,19 +567,21 @@ def read_rubric_page(page: Page) -> dict:
     return json.loads(holder.first.get_attribute("data-react-props") or "{}")
 
 
+def _normalize_title(text: str) -> str:
+    """A title for comparing: case and surrounding or repeated whitespace ignored."""
+    return " ".join(str(text).split()).casefold()
+
+
 def assignments_titled(table_data: list[dict], title: str) -> list[str]:
     """IDs of the assignments with a title, from an Assignments page's ``table_data``.
 
     Titles are compared ignoring case and surrounding or repeated whitespace.
     """
-
-    def normalize(text: str) -> str:
-        return " ".join(str(text).split()).casefold()
-
     return [
         e["url"].rstrip("/").rsplit("/", 1)[-1]
         for e in table_data
-        if e.get("type") == "assignment" and e.get("url") and normalize(e.get("title", "")) == normalize(title)
+        if e.get("type") == "assignment" and e.get("url")
+        and _normalize_title(e.get("title", "")) == _normalize_title(title)
     ]
 
 
@@ -563,6 +591,91 @@ def container_of(table_data: list[dict], assignment: str) -> str | None:
         if e.get("type") == "assignment" and str(e.get("url", "")).rstrip("/").endswith(f"/{assignment}"):
             return None if e.get("container_id") is None else str(e["container_id"])
     return None
+
+
+def _row_id(entry: dict) -> str:
+    """The ID at the end of a table row's URL."""
+    return str(entry.get("url", "")).rstrip("/").rsplit("/", 1)[-1]
+
+
+def find_rows(table_data: list[dict], kind: str, wanted: list[str]) -> tuple[list[dict], list[str]]:
+    """Rows of an Assignments page's ``table_data``, by ID or title.
+
+    Args:
+        table_data: From the Assignments page.
+        kind: "assignment" or "assignment_container" (a version set).
+        wanted: IDs or titles; titles are compared ignoring case and
+            surrounding or repeated whitespace.
+
+    Returns:
+        The rows found, as ``{"id", "title", "submissions"}`` (each once, in
+        the order asked for), and the IDs or titles not found.
+
+    Raises:
+        LookupError: If a title matches more than one row.
+    """
+    rows = [e for e in table_data if e.get("type") == kind and e.get("url")]
+    found: list[dict] = []
+    missing: list[str] = []
+    for want in wanted:
+        if want.isdigit():
+            matches = [e for e in rows if _row_id(e) == want]
+        else:
+            matches = [e for e in rows if _normalize_title(e.get("title", "")) == _normalize_title(want)]
+        if len(matches) > 1:
+            ids = ", ".join(_row_id(e) for e in matches)
+            raise LookupError(f"More than one {kind.replace('_', ' ')} is titled '{want}' (IDs {ids})")
+        if not matches:
+            missing.append(want)
+            continue
+        row = matches[0]
+        if all(f["id"] != _row_id(row) for f in found):
+            found.append({"id": _row_id(row), "title": row.get("title", ""),
+                          "submissions": int(row.get("num_active_submissions") or 0)})
+    return found, missing
+
+
+def _rails_delete(page: Page, path: str) -> None:
+    """Follow a Rails ``data-method="delete"`` link, as clicking it does.
+
+    Rails turns such a link into a submitted form: a POST with
+    ``_method=delete`` and the page's CSRF token, answered by a redirect.
+    The redirect is not followed. (Sent as JSON instead, Gradescope deletes
+    but then answers 500.)
+
+    Raises:
+        RuntimeError: If the response is an error.
+    """
+    csrf = page.locator('meta[name="csrf-token"]').first.get_attribute("content") or ""
+    response = page.request.fetch(
+        urljoin(page.url, path),
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml",
+            "X-CSRF-Token": csrf,
+        },
+        data=urlencode([("_method", "delete"), ("authenticity_token", csrf)]),
+        max_redirects=0,
+    )
+    if response.status >= 400:
+        raise RuntimeError(f"DELETE {path} returned {response.status}: {response.text()[:300]}")
+
+
+def delete_assignment(page: Page, course: str, assignment: str) -> None:
+    """Delete an assignment, with its template, outline and all its submissions.
+
+    This is the "Delete Assignment" button on the assignment's settings page.
+    """
+    _rails_delete(page, f"/courses/{course}/assignments/{assignment}")
+
+
+def delete_assignment_container(page: Page, course: str, container: str) -> None:
+    """Delete an assignment container (a version set). Its assignments are kept, ungrouped.
+
+    This is the "Delete Exam Version Set" button on the version set's settings page.
+    """
+    _rails_delete(page, f"/courses/{course}/assignment_containers/{container}")
 
 
 def create_exam_assignment(page: Page, base_url: str, course: str, title: str, pdf: Path) -> str:
@@ -611,12 +724,32 @@ def read_outline_page(page: Page, base_url: str, course: str, assignment: str) -
     return json.loads(holder.first.get_attribute("data-react-props") or "{}")
 
 
+def with_parent_weights(questions: list[dict]) -> list[dict]:
+    """Questions with each parent's weight set to the sum of its children's.
+
+    An outline file gives weights only to gradable questions. Gradescope's own
+    outline editor saves a parent's weight as the sum of its subquestions', and
+    its rubric editor fails to load (a blank page) if a parent's weight is null.
+    A parent that already has a weight keeps it. The input is not changed.
+    """
+    out = []
+    for q in questions:
+        if q.get("children"):
+            children = with_parent_weights(q["children"])
+            q = q | {"children": children}
+            if not _is_number(q.get("weight")):
+                q["weight"] = sum(float(c.get("weight") or 0) for c in children)
+        out.append(q)
+    return out
+
+
 def save_outline(
     page: Page, base_url: str, course: str, assignment: str, outline: dict, timeout: float = 180
 ) -> bool:
     """Save an outline (see the module docstring) unless the assignment has one.
 
-    Waits for Gradescope to finish reading the template PDF first.
+    Waits for Gradescope to finish reading the template PDF first. A parent
+    question is given the sum of its subquestions' weights (``with_parent_weights``).
 
     Returns:
         True if the outline was saved, False if the assignment already had one.
@@ -647,7 +780,7 @@ def save_outline(
         "PATCH",
         f"/courses/{course}/assignments/{assignment}/outline/",
         {"assignment": {"identification_regions": outline.get("identification_regions") or {}},
-         "question_data": outline["question_data"]},
+         "question_data": with_parent_weights(outline["question_data"])},
     )
     return True
 
@@ -802,7 +935,8 @@ def import_assignment_rubric(
 
     A question whose current rubric already matches the file is left alone, so
     a second run changes nothing. A question with a different rubric is
-    replaced only if ``replace`` is set.
+    replaced only if ``replace`` is set, unless that rubric is the default one
+    Gradescope gives every new question (see ``is_default_rubric``).
 
     Args:
         page: A logged-in page.
@@ -839,7 +973,8 @@ def import_assignment_rubric(
         if has_rubric and same_rubric(current, rubric):
             results.append({"question": label, "status": "unchanged", "changes": []})
             continue
-        if has_rubric and not replace:
+        # Gradescope's default rubric is replaced without asking.
+        if has_rubric and not replace and not is_default_rubric(current):
             results.append({"question": label, "status": "conflict", "changes": []})
             continue
         changes = import_question_rubric(page, course, question, rubric, current if has_rubric else None, dry_run)

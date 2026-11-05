@@ -899,6 +899,95 @@ def setup_exam(
         typer.echo("Run again with --replace-rubrics to replace the rubrics marked 'left alone'.")
 
 
+def _run_deletion(noun: str, course: str, yes: bool, dry_run: bool, call) -> None:
+    """List, confirm and report a deletion made by ``call(confirm)``."""
+
+    def describe(plan: dict) -> None:
+        for r in plan["found"]:
+            count = r["submissions"]
+            typer.echo(f"  {noun} {r['id']} ({r['title']}): {count} submission{'' if count == 1 else 's'}")
+
+    def confirm(plan: dict) -> bool:
+        typer.echo(f"This will delete from course {course}:")
+        describe(plan)
+        return yes or typer.confirm("Delete them?", default=False)
+
+    try:
+        result = call(confirm)
+    except Exception as e:
+        typer.echo(f"Failed to delete: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    for want in result["missing"]:
+        typer.echo(f"No {noun} '{want}' in course {course}.")
+    status = result["status"]
+    if status == "dry run":
+        typer.echo("Would delete:")
+        describe(result)
+    elif status == "cancelled":
+        typer.echo("Nothing deleted.")
+    elif status == "deleted":
+        typer.echo(f"Deleted {len(result['found'])} {noun}{'' if len(result['found']) == 1 else 's'}.")
+
+
+_DELETE_FORCE = typer.Option("--force", help="Delete even if there are submissions")
+_DELETE_YES = typer.Option("--yes", "-y", help="Do not ask for confirmation")
+_DELETE_DRY_RUN = typer.Option("--dry-run", help="Report what would be deleted, but send nothing")
+_DELETE_HEADLESS = typer.Option(
+    "--headless/--headed", help="Run browser headless (for automation) or headed (for debugging)"
+)
+
+
+@client_app.command("delete-assignment")
+def delete_assignment(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    assignments: Annotated[
+        list[str], typer.Argument(help="Assignment IDs or titles (e.g. 'Quiz 5 9:30 a.m. edition')")
+    ],
+    force: Annotated[bool, _DELETE_FORCE] = False,
+    yes: Annotated[bool, _DELETE_YES] = False,
+    dry_run: Annotated[bool, _DELETE_DRY_RUN] = False,
+    headless: Annotated[bool, _DELETE_HEADLESS] = True,
+    base_url: Annotated[str | None, typer.Option(help="Override Gradescope base URL")] = None,
+    auth_state_path: Annotated[Path | None, typer.Option(help="Path to stored auth state JSON")] = None,
+) -> None:
+    """Delete assignments of any kind (exam, quiz, problem set, ...).
+
+    Deleting an assignment deletes its template, outline, rubrics and all
+    student submissions, so an assignment with submissions is refused
+    without --force. What would be deleted is listed, and nothing is
+    deleted until you confirm (or pass --yes). An ID or title that is not
+    found is reported and skipped.
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    _run_deletion("assignment", course, yes, dry_run, lambda confirm: client.delete_assignments(
+        course, assignments, force=force, dry_run=dry_run, confirm=confirm, headless=headless))
+
+
+@client_app.command("delete-assignment-container")
+def delete_assignment_container(
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    containers: Annotated[list[str], typer.Argument(help="Assignment container (version set) IDs or titles")],
+    force: Annotated[bool, _DELETE_FORCE] = False,
+    yes: Annotated[bool, _DELETE_YES] = False,
+    dry_run: Annotated[bool, _DELETE_DRY_RUN] = False,
+    headless: Annotated[bool, _DELETE_HEADLESS] = True,
+    base_url: Annotated[str | None, typer.Option(help="Override Gradescope base URL")] = None,
+    auth_state_path: Annotated[Path | None, typer.Option(help="Path to stored auth state JSON")] = None,
+) -> None:
+    """Delete assignment containers, such as exam version sets.
+
+    The container's assignments are kept, ungrouped; delete them with
+    delete-assignment. A container with submissions is refused without
+    --force. What would be deleted is listed, and nothing is deleted until
+    you confirm (or pass --yes). An ID or title that is not found is
+    reported and skipped.
+    """
+    client = GradescopeClient(base_url=base_url, auth_state_path=auth_state_path)
+    _run_deletion("assignment container", course, yes, dry_run, lambda confirm: client.delete_assignment_containers(
+        course, containers, force=force, dry_run=dry_run, confirm=confirm, headless=headless))
+
+
 @client_app.command("export-outline")
 def export_outline(
     course: Annotated[str, typer.Argument(help="Gradescope course ID")],
