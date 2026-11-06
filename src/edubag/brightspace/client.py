@@ -498,9 +498,16 @@ class BrightspaceClient(LMSClient):
                     browser.close()
                     raise RuntimeError("Authentication session expired.")
 
-                # Navigate to Attendance
-                page.get_by_role("button", name="More Tools").click()
-                page.get_by_role("link", name="Attendance").click()
+                # Open the Attendance tool by URL rather than through the navbar:
+                # courses that never use attendance have no Attendance link, and
+                # clicking for one times out. The tool page itself still loads and
+                # shows an empty state, handled below.
+                ou = re.search(r"/d2l/home/(\d+)", page.url)
+                if ou:
+                    page.goto(f"{self.base_url}d2l/lms/attendance/index.d2l?ou={ou.group(1)}")
+                else:
+                    page.get_by_role("button", name="More Tools").click()
+                    page.get_by_role("link", name="Attendance").click()
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
 
                 # Exit early if there are no attendance registers available
