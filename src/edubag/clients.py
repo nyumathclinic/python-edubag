@@ -4,8 +4,42 @@ This module defines the common interface that all LMS clients should implement,
 ensuring consistency across different learning management system integrations.
 """
 
+import asyncio
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
+
+T = TypeVar("T")
+
+
+def run_sync_in_thread(func: Callable[..., T], *args, **kwargs) -> T:
+    """Run sync Playwright code in a dedicated worker thread with its own event loop.
+
+    Sync Playwright refuses to run inside a thread that already has a running asyncio loop
+    (e.g. Jupyter); a fresh thread avoids that.
+    """
+    result: list = []
+    error: list = []
+
+    def wrapper() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result.append(func(*args, **kwargs))
+        except BaseException as exc:  # re-raised in the caller's thread
+            error.append(exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    thread = threading.Thread(target=wrapper, daemon=False)
+    thread.start()
+    thread.join()
+    if error:
+        raise error[0]
+    return result[0]
 
 
 class LMSClient(ABC):

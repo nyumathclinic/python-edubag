@@ -9,6 +9,7 @@ app = typer.Typer()
 
 # Import submodules at the end to register their commands
 from edubag import (  # noqa: E402
+    aim,  # noqa: F401
     albert,  # noqa: F401
     gmail,  # noqa: F401
     gradescope,  # noqa: F401

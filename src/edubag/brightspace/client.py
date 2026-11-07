@@ -3,7 +3,6 @@
 import asyncio
 import json
 import re
-import subprocess
 import threading
 import time
 from datetime import datetime
@@ -17,6 +16,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from edubag import nyu_sso
 from edubag.brightspace import manage_grades, quizzes
 from edubag.clients import LMSClient
 
@@ -85,103 +85,36 @@ class BrightspaceClient(LMSClient):
         else:
             self.auth_state_path = self._default_auth_state_path()
 
+    # NYU SSO steps live in edubag.nyu_sso (shared with other NYU clients); these wrappers keep
+    # the old method names.
+    _BRIGHTSPACE_LANDING = re.compile(r"https://brightspace\.nyu\.edu/d2l/.*")
+    _DUO_TITLE = "Brightspace login needs Duo approval"
+
     @staticmethod
     def _handle_kmsi_interstitial(page) -> bool:
-        """Handle Microsoft 'Stay signed in?' prompt if it appears.
-
-        Returns True when the interstitial was detected and submitted.
-        """
-        kmsi_heading = page.locator("div[role='heading']", has_text="Stay signed in?")
-        kmsi_checkbox = page.locator("#KmsiCheckboxField")
-        kmsi_submit = page.locator("#idSIButton9")
-
-        heading_visible = kmsi_heading.count() > 0 and kmsi_heading.first.is_visible()
-        checkbox_visible = kmsi_checkbox.count() > 0 and kmsi_checkbox.first.is_visible()
-        if not heading_visible and not checkbox_visible:
-            return False
-
-        if checkbox_visible and not kmsi_checkbox.first.is_checked():
-            kmsi_checkbox.first.check()
-        if kmsi_submit.count() > 0 and kmsi_submit.first.is_visible():
-            kmsi_submit.first.click()
-            logger.debug("Handled 'Stay signed in?' interstitial during Brightspace authentication")
-            return True
-        return False
+        """Handle Microsoft 'Stay signed in?' prompt if it appears."""
+        return nyu_sso.handle_kmsi_interstitial(page)
 
     @staticmethod
     def _wait_for_login_form_or_landing(page, timeout_ms: int = 20000) -> bool:
-        """Poll until either the SSO email field or the D2L landing page appears.
-
-        A trusted browser/session can cause SSO to redirect straight to the
-        Brightspace landing page without ever showing a login form.
-
-        Returns True if the landing page appeared first (fully trusted session,
-        no login form was shown at all).
-        """
-        deadline = time.monotonic() + (timeout_ms / 1000)
-        brightspace_url = re.compile(r"https://brightspace\.nyu\.edu/d2l/.*")
-        email_field = page.locator("input[type='email']")
-
-        while time.monotonic() < deadline:
-            if brightspace_url.match(page.url):
-                return True
-            if email_field.count() > 0 and email_field.first.is_visible():
-                return False
-            page.wait_for_timeout(250)
-
-        raise PlaywrightTimeoutError(
-            "Timed out waiting for either the SSO login form or the Brightspace landing page"
+        """Poll until either the SSO email field or the D2L landing page appears."""
+        return nyu_sso.wait_for_login_form_or_landing(
+            page, BrightspaceClient._BRIGHTSPACE_LANDING, timeout_ms
         )
 
     @staticmethod
     def _notify_duo_push_sent() -> None:
         """Fire a local desktop notification so a Duo push isn't missed."""
-        try:
-            subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    'display notification "Approve the push in Duo Mobile to continue." '
-                    'with title "Brightspace login needs Duo approval" sound name "Ping"',
-                ],
-                check=False,
-                timeout=5,
-            )
-        except OSError:
-            logger.debug("Could not send desktop notification for Duo push (osascript unavailable).")
+        nyu_sso.notify_duo_push_sent(BrightspaceClient._DUO_TITLE)
 
     @staticmethod
     def _approve_duo_if_challenged(page, timeout_ms: int = 8000) -> bool:
-        """Click the Duo push-approval button only if NYU actually challenges for MFA.
-
-        A trusted browser/session can skip the Duo challenge entirely, in which
-        case this button never appears. Returns True if a challenge was found
-        and the push was triggered.
-        """
-        duo_button = page.get_by_role("button", name="Approve with MFA (Duo)‎ You")
-        try:
-            duo_button.wait_for(state="visible", timeout=timeout_ms)
-        except PlaywrightTimeoutError:
-            return False
-
-        duo_button.click()
-        BrightspaceClient._notify_duo_push_sent()
-        return True
+        """Click the Duo push-approval button only if NYU actually challenges for MFA."""
+        return nyu_sso.approve_duo_if_challenged(page, timeout_ms, BrightspaceClient._DUO_TITLE)
 
     def _wait_for_brightspace_landing(self, page, timeout_ms: int = 120000) -> None:
         """Wait for Brightspace landing while opportunistically handling KMSI prompt."""
-        deadline = time.monotonic() + (timeout_ms / 1000)
-        brightspace_url = re.compile(r"https://brightspace\.nyu\.edu/d2l/.*")
-
-        while time.monotonic() < deadline:
-            if brightspace_url.match(page.url):
-                return
-
-            # KMSI may appear after Duo; dismiss it and continue redirects.
-            self._handle_kmsi_interstitial(page)
-            page.wait_for_timeout(750)
-
-        raise PlaywrightTimeoutError("Timed out waiting for Brightspace post-login landing page")
+        nyu_sso.wait_for_landing(page, self._BRIGHTSPACE_LANDING, timeout_ms, self._DUO_TITLE)
 
     def _run_with_reauth(self, operation: Callable[[], T], headless: bool) -> T:
         """Run an operation with one re-authentication retry on auth expiration."""
