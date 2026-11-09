@@ -363,9 +363,12 @@ class AlbertClient(LMSClient):
         section_name = section_name.strip() if section_name else ""
         logger.info(f"Processing roster for section: {section_name}")
         roster_page.get_by_label("Print/Download Options").select_option("EXL")
-        with roster_page.expect_download() as download_info:
-            with roster_page.expect_popup():
-                roster_page.get_by_role("button", name="Generate").click()
+        # Generate also opens a popup, but the download fires on this page. Don't nest an
+        # expect_popup() in here: if the inner wait times out, Playwright's sync API leaves its
+        # event loop marked running, so closing the browser (and every later session, i.e. the
+        # retry) fails with "This event loop is already running".
+        with roster_page.expect_download(timeout=60_000) as download_info:
+            roster_page.get_by_role("button", name="Generate").click()
         download = download_info.value
         if save_path is not None:
             save_path.mkdir(parents=True, exist_ok=True)
@@ -746,7 +749,7 @@ class AlbertClient(LMSClient):
         for attempt in range(max_retries + 1):
             try:
                 return self._fetch_rosters_session(course_name, term, save_dir, headless, fmt)
-            except (TimeoutError, RuntimeError) as e:
+            except (TimeoutError, PlaywrightTimeoutError, RuntimeError) as e:
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")
                     logger.info("Re-authenticating...")
@@ -853,7 +856,7 @@ class AlbertClient(LMSClient):
                     logger.info(f"Class details saved to {output}")
 
                 return result
-            except (TimeoutError, RuntimeError) as e:
+            except (TimeoutError, PlaywrightTimeoutError, RuntimeError) as e:
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")
                     logger.info("Re-authenticating...")
@@ -1058,7 +1061,7 @@ class AlbertClient(LMSClient):
             try:
                 self._mark_engaged_session(class_number, term, email_addresses, headless)
                 return
-            except (TimeoutError, RuntimeError) as e:
+            except (TimeoutError, PlaywrightTimeoutError, RuntimeError) as e:
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")
                     logger.info("Re-authenticating...")

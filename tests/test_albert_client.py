@@ -201,3 +201,60 @@ class TestHeaderNamesClass:
 
     def test_header_without_class_number_is_accepted(self):
         assert AlbertClient._header_names_class({"class_type": "Lecture"}, 10434)
+
+
+class TestRetries:
+    """A Playwright timeout (not a builtin TimeoutError) must trigger the retry."""
+
+    def _client(self, tmp_path, monkeypatch, method, result):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        state = tmp_path / "auth.json"
+        state.write_text("{}")
+        client = AlbertClient(auth_state_path=state)
+        calls = []
+
+        def session(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise PlaywrightTimeoutError("Timeout 30000ms exceeded.")
+            return result
+
+        monkeypatch.setattr(client, method, session)
+        monkeypatch.setattr(client, "authenticate", lambda **kw: state.write_text("{}"))
+        return client, calls
+
+    def test_rosters_retry_on_playwright_timeout(self, tmp_path, monkeypatch):
+        client, calls = self._client(tmp_path, monkeypatch, "_fetch_rosters_session", ["r.xls"])
+        assert client.fetch_and_save_rosters("Calculus II", "Fall 2026") == ["r.xls"]
+        assert len(calls) == 2
+
+    def test_class_details_retry_on_playwright_timeout(self, tmp_path, monkeypatch):
+        client, calls = self._client(tmp_path, monkeypatch, "_fetch_class_details_session", [{"a": 1}])
+        assert client.fetch_class_details("Calculus II", "Fall 2026") == [{"a": 1}]
+        assert len(calls) == 2
+
+
+def test_no_nested_playwright_waits():
+    """Nesting page.expect_*() waits breaks Playwright's sync API when the inner one times out:
+    its event loop stays marked running, so closing the browser and every later session fail."""
+    import ast
+    from pathlib import Path
+
+    import edubag
+
+    def is_wait(item):
+        c = item.context_expr
+        return isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr.startswith("expect_")
+
+    nested = []
+    for path in Path(edubag.__file__).parent.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.With) and any(is_wait(i) for i in node.items):
+                inner = [
+                    n for n in ast.walk(node)
+                    if n is not node and isinstance(n, ast.With) and any(is_wait(i) for i in n.items)
+                ]
+                if inner or sum(is_wait(i) for i in node.items) > 1:
+                    nested.append(f"{path.name}:{node.lineno}")
+    assert not nested, f"nested expect_* waits: {nested}"
