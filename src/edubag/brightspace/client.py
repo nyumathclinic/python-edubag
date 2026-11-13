@@ -1270,11 +1270,14 @@ class BrightspaceClient(LMSClient):
                         return {**summary, "status": "unchanged"}
 
                     allow_import["on"] = True
-                    page.get_by_role("button", name="Import", exact=True).click()
-                    page.wait_for_url(lambda url: "preview.d2l" not in url.lower(), timeout=180000)
-                    page.wait_for_load_state("networkidle")
+                    # A finished import redirects to Enter Grades with a feedback code;
+                    # the guard still blocks that page, so wait for the request itself.
+                    with page.expect_request(
+                        lambda r: import_grades.is_import_done_redirect(r.url), timeout=180000
+                    ) as redirect:
+                        page.get_by_role("button", name="Import", exact=True).click()
                     allow_import["on"] = False
-                    logger.info(f"Import finished at {page.url}")
+                    logger.info(f"Import finished; Brightspace redirected to {redirect.value.url}")
 
                     # Confirm by previewing the same file again: nothing should change now.
                     check = self._preview_import(page, course, csv_path)

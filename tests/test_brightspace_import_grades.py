@@ -106,3 +106,11 @@ def test_description_html():
     assert import_grades.description_html({"Description": {"Text": "", "Html": "<p>x</p>"}}) == "<p>x</p>"
     assert import_grades.description_html({"Description": {"Text": "a < b", "Html": ""}}) == "a &lt; b"
     assert import_grades.description_html({}) == ""
+
+
+def test_is_import_done_redirect():
+    assert import_grades.is_import_done_redirect(
+        BASE + "d2l/lms/grades/admin/enter/user_list_view.d2l?feedback=6&ou=609453"
+    )
+    assert not import_grades.is_import_done_redirect(BASE + "d2l/lms/grades/admin/enter/user_list_view.d2l?ou=1")
+    assert not import_grades.is_import_done_redirect(IMPORT + "preview.d2l?feedback=6&ou=1")

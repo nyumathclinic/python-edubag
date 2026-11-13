@@ -9,7 +9,8 @@ Import Grades (Grades -> Enter Grades -> Import) is a three-step wizard:
    when there are none); Continue goes on through an ``errors_view.d2lfile``
    RPC;
 3. ``preview.d2l``: each student's grades as ``old -> new``; only its Import
-   button writes grades.
+   button writes grades, after which Brightspace redirects to Enter Grades
+   (``user_list_view.d2l?feedback=6``).
 
 Descriptions are read and written through the Valence grade object API.
 """
@@ -71,6 +72,17 @@ def is_import_request(method: str, url: str, allow_import: bool = False) -> bool
     if step in _PREVIEW_STEPS:
         return True
     return allow_import and step in _IMPORT_STEPS
+
+
+def is_import_done_redirect(url: str) -> bool:
+    """Whether a URL is where Brightspace sends the browser after an import.
+
+    It is Enter Grades with a ``feedback`` code, e.g.
+    ``.../grades/admin/enter/user_list_view.d2l?feedback=6&ou=609453``.
+    The guard still blocks it; only the request is awaited.
+    """
+    parsed = urlparse(url)
+    return parsed.path.endswith("/grades/admin/enter/user_list_view.d2l") and "feedback=" in parsed.query
 
 
 # Step 2's grid of errors and warnings: one list of cell texts per row, with
