@@ -17,7 +17,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from edubag import nyu_sso
-from edubag.brightspace import manage_grades, quizzes
+from edubag.brightspace import import_grades, manage_grades, quizzes
 from edubag.clients import LMSClient
 
 T = TypeVar("T")
@@ -1194,6 +1194,239 @@ class BrightspaceClient(LMSClient):
         self._run_with_reauth(
             lambda: self._save_quiz_reports_session(
                 course, quiz_ids, reports, save_dir, results, headless, excel, all_attempts
+            ),
+            headless=headless,
+        )
+        return results
+
+    # ----- Import Grades ---------------------------------------------------------
+
+    def _preview_import(self, page, course: str, csv_path: Path) -> dict:
+        """Run Import Grades up to its preview step and read what it would change.
+
+        Raises LookupError if the file has errors or warnings, and RuntimeError
+        if authentication has expired.
+        """
+        page.goto(import_grades.file_select_url(self.base_url, course))
+        if "login" in page.url or urlparse(page.url).netloc != urlparse(self.base_url).netloc:
+            logger.error("Authentication session expired. Please re-authenticate.")
+            raise RuntimeError("Authentication session expired.")
+        page.wait_for_load_state("networkidle")
+
+        # Never create grade items for unrecognized columns.
+        page.locator("input[name='ItemCreation']").uncheck()
+        page.set_input_files("input[name='csvImport_file_0']", str(csv_path))
+        page.get_by_role("button", name="Continue", exact=True).click()
+        page.wait_for_url(re.compile(r"/errors_view\.d2l", re.IGNORECASE), timeout=120000)
+        page.wait_for_load_state("networkidle")
+
+        problems = page.evaluate(import_grades.EXTRACT_ERRORS_JS)
+        if problems is None:
+            raise LookupError(f"Errors and warnings step not found at {page.url}")
+        if problems:
+            for row in problems:
+                logger.error(f"Import problem: {' | '.join(row)}")
+            raise LookupError(f"Import Grades found {len(problems) - 1} error(s) or warning(s); not importing")
+
+        page.get_by_role("button", name="Continue", exact=True).click()
+        page.wait_for_url(re.compile(r"/preview\.d2l", re.IGNORECASE), timeout=120000)
+        page.wait_for_load_state("networkidle")
+        preview = page.evaluate(import_grades.EXTRACT_PREVIEW_JS)
+        if preview is None:
+            raise LookupError(f"Preview step not found at {page.url}")
+        return import_grades.summarize_preview(preview)
+
+    def _import_grades_session(
+        self, course: str, csv_path: Path, headless: bool = True, dry_run: bool = False
+    ) -> dict:
+        """Internal method to import a grades CSV in a single browser session.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do_import():
+            allow_import = {"on": False}
+
+            def _guard(route):
+                request = route.request
+                if import_grades.is_import_request(request.method, request.url, allow_import["on"]):
+                    route.continue_()
+                else:
+                    logger.debug(f"Blocked request: {request.method} {request.url}")
+                    route.abort()
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                context.route("**/*", _guard)
+                page = context.new_page()
+                try:
+                    summary = self._preview_import(page, course, csv_path)
+                    logger.info(
+                        f"Preview: {summary['students']} students; changed grades per item: {summary['changed']}"
+                    )
+                    if dry_run:
+                        return {**summary, "status": "dry run"}
+                    if not any(summary["changed"].values()):
+                        return {**summary, "status": "unchanged"}
+
+                    allow_import["on"] = True
+                    page.get_by_role("button", name="Import", exact=True).click()
+                    page.wait_for_url(lambda url: "preview.d2l" not in url.lower(), timeout=180000)
+                    page.wait_for_load_state("networkidle")
+                    allow_import["on"] = False
+                    logger.info(f"Import finished at {page.url}")
+
+                    # Confirm by previewing the same file again: nothing should change now.
+                    check = self._preview_import(page, course, csv_path)
+                    left = {item: n for item, n in check["changed"].items() if n}
+                    if left:
+                        raise LookupError(f"Grades not imported; preview still shows changes: {left}")
+                    return {**summary, "status": "imported"}
+                finally:
+                    browser.close()
+
+        return _run_sync_in_thread(_do_import)
+
+    def import_grades(
+        self, course: str, csv_path: Path, headless: bool = True, dry_run: bool = False
+    ) -> dict:
+        """Import a Brightspace-format grades CSV with Grades -> Import.
+
+        The CSV needs a ``Username`` (or ``OrgDefinedId``) column, one
+        ``<item> Points Grade`` column per existing grade item, and an
+        ``End-of-Line Indicator`` column. New grade items are never created.
+        Any error or warning stops the import. Afterwards the same file is
+        previewed again to confirm that nothing is left to change.
+
+        Args:
+          * course: The course org unit ID (``ou``)
+          * csv_path: The CSV file to import
+          * headless: Whether to run the browser in headless mode
+          * dry_run: Stop at the preview step without importing
+
+        Returns:
+            dict: students, items, changed (count of changed grades per item)
+            and status ("imported", "unchanged" or "dry run").
+
+        Raises:
+            LookupError: the file has errors or warnings, or the import did not take.
+        """
+        return self._run_with_reauth(
+            lambda: self._import_grades_session(course, csv_path, headless, dry_run),
+            headless=headless,
+        )
+
+    # ----- Grade item descriptions -----------------------------------------------
+
+    def _stamp_descriptions_session(
+        self,
+        course: str,
+        names: Sequence[str],
+        stamp: str,
+        marker: str,
+        results: dict[str, dict],
+        headless: bool = True,
+        dry_run: bool = False,
+    ) -> None:
+        """Internal method to stamp grade item descriptions in a single browser session.
+
+        Records each item's outcome in ``results`` and skips items already
+        recorded, so a re-authentication retry resumes where it stopped.
+
+        Raises RuntimeError if authentication has expired.
+        """
+        def _do_stamp():
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context(storage_state=self.auth_state_path)
+                page = context.new_page()
+                try:
+                    self._open_course_home(page, course)
+                    response = page.request.get(import_grades.grade_objects_url(self.base_url, course))
+                    if not response.ok:
+                        raise PlaywrightError(f"Grade object list request failed ({response.status})")
+                    by_name = {g["Name"]: g for g in json.loads(quizzes.strip_xssi(response.text()))}
+                    # Valence writes with a cookie session need the page's XSRF token.
+                    token = page.evaluate("() => localStorage.getItem('XSRF.Token')")
+                    headers = {"X-Csrf-Token": token or "", "Content-Type": "application/json"}
+
+                    for name in names:
+                        if name in results:
+                            continue
+                        record: dict = {"name": name}
+                        results[name] = record
+                        grade_object = by_name.get(name)
+                        if grade_object is None:
+                            record.update(status="failed", error="no grade item with this name")
+                            logger.error(f"{name}: no grade item with this name in course {course}")
+                            continue
+                        record["id"] = grade_object["Id"]
+                        before = import_grades.description_html(grade_object)
+                        after = import_grades.apply_stamp(before, stamp, marker)
+                        record["before"], record["after"] = before, after
+                        if import_grades.same_html(before, after):
+                            record["status"] = "unchanged"
+                            continue
+                        if dry_run:
+                            record["status"] = "dry run"
+                            logger.info(f"{name}: would set description to {after!r}")
+                            continue
+
+                        url = import_grades.grade_objects_url(self.base_url, course, grade_object["Id"])
+                        body = import_grades.grade_object_update(grade_object, after)
+                        try:
+                            response = page.request.put(url, headers=headers, data=json.dumps(body))
+                            if not response.ok:
+                                raise PlaywrightError(
+                                    f"Update failed ({response.status}): {response.text()[:300]}"
+                                )
+                            # Re-read from the server to confirm the save took.
+                            saved = json.loads(quizzes.strip_xssi(page.request.get(url).text()))
+                            saved_html = import_grades.description_html(saved)
+                            if import_grades._text(stamp) not in import_grades._text(saved_html):
+                                raise LookupError(f"Description not saved; server has {saved_html!r}")
+                            record["status"] = "updated"
+                            logger.info(f"{name}: description stamped")
+                        except (PlaywrightError, LookupError) as e:
+                            logger.error(f"Failed to update description of {name}: {e}")
+                            record.update(status="failed", error=str(e))
+                finally:
+                    browser.close()
+
+        _run_sync_in_thread(_do_stamp)
+
+    def stamp_grade_item_descriptions(
+        self,
+        course: str,
+        names: Sequence[str],
+        stamp: str,
+        marker: str = "Last updated",
+        headless: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, dict]:
+        """Add or replace a closing "stamp" paragraph in grade item descriptions.
+
+        The rest of each description is kept. A previous stamp is any
+        paragraph whose text starts with ``marker``; ``stamp`` must start with
+        it too. Grade items are found by name. A failure on one item is
+        recorded and the remaining items are still processed.
+
+        Args:
+          * course: The course org unit ID (``ou``)
+          * names: Grade item names, as shown in Manage Grades
+          * stamp: HTML paragraph to add, e.g. ``<p><em>Last updated ...</em></p>``
+          * marker: Text that starts the stamp paragraph
+          * headless: Whether to run the browser in headless mode
+          * dry_run: Report the new descriptions without saving
+
+        Returns:
+            dict[str, dict]: Per name: id, before, after, status ("updated",
+            "unchanged", "dry run" or "failed") and any error.
+        """
+        results: dict[str, dict] = {}
+        self._run_with_reauth(
+            lambda: self._stamp_descriptions_session(
+                course, names, stamp, marker, results, headless, dry_run
             ),
             headless=headless,
         )

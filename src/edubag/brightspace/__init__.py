@@ -852,6 +852,91 @@ def clear_grades(
         raise typer.Exit(code=1)
 
 
+@client_app.command("import-grades")
+def import_grades_cmd(
+    course: Annotated[str, typer.Argument(help="Course ID (ou)")],
+    csv_path: Annotated[
+        Path, typer.Argument(help="Brightspace-format grades CSV (Username, '<item> Points Grade', ...)")
+    ],
+    dry_run: Annotated[
+        bool, typer.Option(help="Stop at the preview step without importing")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Import grades from a CSV with Grades -> Import (never creates grade items).
+
+    Example:
+        python -m edubag brightspace client import-grades 611388 engagement.csv --dry-run
+    """
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        result = client.import_grades(course, csv_path, headless=headless, dry_run=dry_run)
+    except LookupError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"{result['status']}: {result['students']} students")
+    for item, n in result["changed"].items():
+        typer.echo(f"  {n:>4} changed  {item}")
+
+
+@client_app.command("stamp-descriptions")
+def stamp_descriptions_cmd(
+    course: Annotated[str, typer.Argument(help="Course ID (ou)")],
+    stamp: Annotated[str, typer.Argument(help="HTML paragraph to add; its text must start with --marker")],
+    names: Annotated[list[str], typer.Argument(help="Grade item names")],
+    marker: Annotated[
+        str, typer.Option(help="Text that starts the stamp paragraph (replaced on later runs)")
+    ] = "Last updated",
+    dry_run: Annotated[
+        bool, typer.Option(help="Show the new descriptions without saving")
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging)",
+        ),
+    ] = True,
+    base_url: Annotated[
+        str | None, typer.Option(help="Override Brightspace base URL")
+    ] = None,
+    auth_state_path: Annotated[
+        Path | None, typer.Option(help="Path to stored auth state JSON")
+    ] = None,
+) -> None:
+    """Add or replace a "Last updated ..." paragraph at the end of grade item descriptions.
+
+    Example:
+        python -m edubag brightspace client stamp-descriptions 611388 \\
+            "<p><em>Last updated Nov 13.</em></p>" "Poll Participation Rate" --dry-run
+    """
+    client = BrightspaceClient(base_url=base_url, auth_state_path=auth_state_path)
+    try:
+        results = client.stamp_grade_item_descriptions(
+            course, names, stamp, marker=marker, headless=headless, dry_run=dry_run
+        )
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    for name, r in results.items():
+        typer.echo(f"{r['status']:>9}  {r.get('id', '')}  {name}" + (f"  ({r['error']})" if "error" in r else ""))
+        if dry_run and r["status"] == "dry run":
+            typer.echo(f"           -> {r['after']}")
+    if any(r["status"] == "failed" for r in results.values()):
+        raise typer.Exit(code=1)
+
+
 @client_app.command("list-quizzes")
 def list_quizzes(
     course: Annotated[str, typer.Argument(help="Course ID (ou)")],
