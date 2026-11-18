@@ -10,6 +10,17 @@ ASP.NET GridView with one row per student exam::
 
 Checking up to 10 rows and clicking "Download Selected Exams" returns a flat ZIP
 (``CompletedExam-<n>.zip``) of PDFs named like ``(11057CN) E12740317416842.pdf``.
+
+``Testing.aspx?Step=Exams`` ("Upcoming Exams") lists scheduled testing-center sessions, one row
+per student appointment::
+
+    [checkbox] Status | Detail | CRN | Subject | Course | Section | Full Name | Type | Exam Date |
+    Time Range | Campus | Late | Proctor | Location | Requested On
+
+A row whose exam file has been uploaded has a "View File" section in its Status cell listing each
+file's title, upload date, and a ``Testing.aspx?Step=Exams&Plan=Delete&...`` link. Checking rows,
+filling the "Upcoming Exam File Upload" form (title, file) and clicking "Upload Selected File"
+attaches one file to every checked row.
 """
 
 from __future__ import annotations
@@ -32,6 +43,15 @@ DOWNLOAD_BUTTON_ID = CONTROL_PREFIX + "PnlDownload_BtnDownload"
 FERPA_CONTINUE_ID = CONTROL_PREFIX + "IMConfirmation_BtnContinue"
 TERM_NAV_ID = CONTROL_PREFIX + "TermNav"
 MAX_PER_DOWNLOAD = 10
+
+# Testing.aspx?Step=Exams (Upcoming Exams)
+EXAMS_GRID_ID = CONTROL_PREFIX + "GV"
+EXAMS_PAGE_SIZE_ID = CONTROL_PREFIX + "PgGV_DDLShowLimit"
+UPLOAD_TITLE_ID = CONTROL_PREFIX + "GFormUpload_TxtBoxUploadTitle_TxtBoxInput"
+UPLOAD_FILE_ID = CONTROL_PREFIX + "GFormUpload_TxtBoxFile_TxtBoxFile"
+UPLOAD_BUTTON_ID = CONTROL_PREFIX + "GFormUpload_BtnUpload"
+UPLOAD_TITLE_MAX = 100  # the title box's maxlength
+UPLOAD_MAX_BYTES = 30_000_000  # "Maximum Size: 30 MB"
 
 # Header text -> ExamRow field
 COLUMNS = {
@@ -100,25 +120,30 @@ class ExamRow:
         return d
 
 
-def parse_completed_table(html: str) -> list[ExamRow]:
-    """The exam rows of a ``Testing.aspx?Step=Completed`` page."""
+def _grid_rows(html: str, grid_id: str, columns: dict[str, str], what: str):
+    """The data rows of an AIM GridView as ``(cells, checkbox, index)``.
+
+    ``index`` maps each field in ``columns`` (header text -> field) to its cell position.
+    Header text is matched ignoring case. Raises ValueError if the table or a column is missing;
+    an empty-result page gives no rows.
+    """
     soup = BeautifulSoup(html, "lxml")
-    grid = soup.find(id=GRID_ID)
+    grid = soup.find(id=grid_id)
     if grid is None:
         if "There is no" in soup.get_text() or "No record" in soup.get_text():
-            return []
-        raise ValueError("Completed exams table not found on the page")
+            return
+        raise ValueError(f"{what} table not found on the page")
     rows = grid.find_all("tr")
     header = next((r for r in rows if "gv_header" in (r.get("class") or [])), None)
+    header = header or next((r for r in rows if r.find("th")), None)
     if header is None:
-        raise ValueError("Completed exams table has no header row")
+        raise ValueError(f"{what} table has no header row")
     names = [_text(th) for th in header.find_all("th")]
-    index = {COLUMNS[n]: i for i, n in enumerate(names) if n in COLUMNS}
-    missing = set(COLUMNS.values()) - set(index)
+    wanted = {k.casefold(): v for k, v in columns.items()}
+    index = {wanted[n.casefold()]: i for i, n in enumerate(names) if n.casefold() in wanted}
+    missing = set(columns.values()) - set(index)
     if missing:
-        raise ValueError(f"Completed exams table is missing columns {sorted(missing)}; got {names}")
-
-    out = []
+        raise ValueError(f"{what} table is missing columns {sorted(missing)}; got {names}")
     for r in rows:
         if r is header:
             continue
@@ -126,9 +151,20 @@ def parse_completed_table(html: str) -> list[ExamRow]:
         checkbox = r.find("input", type="checkbox")
         if len(cells) < len(names) or checkbox is None:
             continue  # pager/empty-data rows
+        yield cells, checkbox, index
+
+
+def _mailto(cell) -> str:
+    a = cell.find("a", href=re.compile(r"^mailto:", re.I))
+    return a["href"].split(":", 1)[1].strip() if a else ""
+
+
+def parse_completed_table(html: str) -> list[ExamRow]:
+    """The exam rows of a ``Testing.aspx?Step=Completed`` page."""
+    out = []
+    for cells, checkbox, index in _grid_rows(html, GRID_ID, COLUMNS, "Completed exams"):
         values = {f: _text(cells[i]) for f, i in index.items()}
-        mailto = cells[index["name"]].find("a", href=re.compile(r"^mailto:", re.I))
-        email = mailto["href"].split(":", 1)[1].strip() if mailto else ""
+        email = _mailto(cells[index["name"]])
         out.append(
             ExamRow(
                 crn=values["crn"],
@@ -144,6 +180,104 @@ def parse_completed_table(html: str) -> list[ExamRow]:
                 proctor=values["proctor"],
                 uploaded_on=parse_date(values["uploaded_on"]),
                 checkbox_id=checkbox.get("id", ""),
+            )
+        )
+    return out
+
+
+UPCOMING_COLUMNS = {
+    "Status": "status",
+    "CRN": "crn",
+    "Subject": "subject",
+    "Course": "course",
+    "Section": "section",
+    "Full Name": "name",
+    "Type": "type",
+    "Exam Date": "exam_date",
+    "Time Range": "time_range",
+}
+
+
+@dataclass
+class ExamFile:
+    """A file attached to an upcoming exam session (shown under "View File")."""
+
+    title: str
+    uploaded_on: dt.date | None
+    delete_href: str  # relative to instructor/, e.g. "Testing.aspx?Step=Exams&Plan=Delete&..."
+
+
+@dataclass
+class UpcomingRow:
+    """One student's scheduled exam session in the Upcoming Exams table."""
+
+    crn: str
+    subject: str
+    course: str
+    section: str
+    name: str
+    email: str
+    type: str
+    exam_date: dt.date | None
+    time_range: str
+    status: str
+    checkbox_id: str
+    files: list[ExamFile]
+
+    @property
+    def key(self) -> str:
+        """Identifies the session across page loads (checkbox IDs follow row order)."""
+        when = self.exam_date.isoformat() if self.exam_date else ""
+        return "|".join([self.crn, self.email.lower(), self.type, when, self.time_range])
+
+    @property
+    def netid(self) -> str:
+        """The student's NetID: the user part of an @nyu.edu address, else ""."""
+        user, _, domain = self.email.lower().partition("@")
+        return user if domain == "nyu.edu" else ""
+
+
+def _exam_files(cell) -> list[ExamFile]:
+    out = []
+    for li in cell.select("ul.files > li"):
+        delete = li.find("a", href=re.compile(r"Plan=Delete", re.I))
+        link = li.find("a", class_="bold") or li.find("a", href=re.compile(r"Download\.aspx", re.I))
+        uploaded = None
+        for p in li.find_all("p"):
+            m = re.match(r"Uploaded:\s*(\S+)", _text(p))
+            if m:
+                uploaded = parse_date(m.group(1))
+        out.append(
+            ExamFile(
+                title=_text(link),
+                uploaded_on=uploaded,
+                delete_href=delete["href"] if delete else "",
+            )
+        )
+    return out
+
+
+def parse_upcoming_table(html: str) -> list[UpcomingRow]:
+    """The session rows of a ``Testing.aspx?Step=Exams`` (Upcoming Exams) page."""
+    out = []
+    for cells, checkbox, index in _grid_rows(html, EXAMS_GRID_ID, UPCOMING_COLUMNS, "Upcoming exams"):
+        status_cell = cells[index["status"]]
+        strong = status_cell.find("strong")
+        values = {f: _text(cells[i]) for f, i in index.items()}
+        out.append(
+            UpcomingRow(
+                crn=values["crn"],
+                subject=values["subject"],
+                course=values["course"],
+                section=values["section"],
+                name=values["name"],
+                email=_mailto(cells[index["name"]]),
+                type=values["type"],
+                exam_date=parse_date(values["exam_date"]),
+                time_range=values["time_range"],
+                status=_text(strong) if strong else values["status"],
+                checkbox_id=checkbox.get("id", ""),
+                files=_exam_files(status_cell),
             )
         )
     return out
@@ -229,13 +363,13 @@ class ExamFilter:
         """Last matching exam date."""
         return self.until or self.date
 
-    def matches(self, row: ExamRow) -> bool:
+    def matches(self, row: ExamRow | UpcomingRow) -> bool:
         for attr in ("crn", "type", "subject", "course", "section"):
             wanted = getattr(self, attr)
             if wanted is not None and getattr(row, attr).strip().casefold() not in wanted:
                 return False
         if self.date is not None:
-            if row.exam_date is None or not (self.date <= row.exam_date <= self.end):
+            if row.exam_date is None or not (self.date <= row.exam_date <= (self.until or self.date)):
                 return False
         return True
 

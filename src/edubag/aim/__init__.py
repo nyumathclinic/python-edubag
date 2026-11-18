@@ -10,6 +10,7 @@ from edubag import app as main_app
 
 from .client import AimClient, AimError
 from .portal import ExamFilter
+from .upload import AMBIGUOUS, NO_PDF, load_upload_config
 
 app = typer.Typer(help="AIM instructor portal (Moses Center testing accommodations)")
 client_app = typer.Typer(help="Automate the AIM instructor portal")
@@ -111,6 +112,57 @@ def save_exams(
         for f in b.files:
             typer.echo(str(f))
     typer.echo(f"{sum(len(b.rows) for b in batches)} exam(s) in {len(batches)} ZIP(s)", err=True)
+
+
+@client_app.command("upload-exams")
+def upload_exams(
+    config_path: Annotated[Path, typer.Argument(help="Upload config (YAML), e.g. written by `l3build aimupload`")],
+    netid: Annotated[list[str] | None, typer.Option("--netid", help="Only this student; repeatable")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Only show what would be uploaded or deleted")] = False,
+    term: Term = None,
+    headless: Headless = True,
+    base_url: BaseUrl = None,
+    auth_state_path: AuthStatePath = None,
+) -> None:
+    """Upload personalized exams to students' Upcoming Exams sessions.
+
+    Uploads where a session has no file for this exam, replaces files of older versions (tags),
+    and skips sessions that already have this version. Run it again as students book sessions.
+    Prints NetIDs only, never names.
+    """
+    try:
+        config = load_upload_config(config_path)
+    except (OSError, ValueError, KeyError) as e:
+        typer.echo(f"Bad upload config: {e}", err=True)
+        raise typer.Exit(code=1) from e
+    wanted = {n.strip().lower() for n in netid} if netid else None
+    if wanted:
+        unknown = wanted - {s.netid for s in config.students}
+        if unknown:
+            raise typer.BadParameter(f"Not in {config_path.name}: {', '.join(sorted(unknown))}")
+    client = AimClient(base_url=base_url, auth_state_path=auth_state_path)
+    label = "would " if dry_run else ""
+    try:
+        actions = client.upload_exams(
+            config,
+            netids=wanted,
+            dry_run=dry_run,
+            headless=headless,
+            term=term,
+            on_action=lambda a: typer.echo(f"done  {a.describe()}", err=True),
+        )
+    except (AimError, OSError, ValueError) as e:
+        typer.echo(f"{e}\nRun it again: sessions that got their file are skipped.", err=True)
+        raise typer.Exit(code=1) from e
+    for a in actions:
+        typer.echo(a.describe())
+    counts: dict[str, int] = {}
+    for a in actions:
+        counts[a.kind] = counts.get(a.kind, 0) + 1
+    summary = ", ".join(f"{n} {k}" for k, n in sorted(counts.items())) or "no students"
+    typer.echo(f"{config.module} {config.tag}: {label}{summary}", err=True)
+    if any(a.kind in (AMBIGUOUS, NO_PDF) for a in actions):
+        raise typer.Exit(code=2)
 
 
 main_app.add_typer(app, name="aim")

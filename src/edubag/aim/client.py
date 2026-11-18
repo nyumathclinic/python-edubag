@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TypeVar
+from urllib.parse import urljoin
 
 import platformdirs
 from loguru import logger
@@ -28,8 +29,10 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from edubag import nyu_sso
-from edubag.aim import portal
-from edubag.aim.portal import ExamFilter, ExamRow
+from edubag.aim import portal, upload
+from edubag.aim.ledger import Ledger
+from edubag.aim.portal import ExamFilter, ExamRow, UpcomingRow
+from edubag.aim.upload import Action, UploadConfig
 from edubag.clients import LMSClient, run_sync_in_thread
 
 T = TypeVar("T")
@@ -38,10 +41,24 @@ ON_AIM = re.compile(r"https://[^/]*accessiblelearning\.com/NYU/", re.I)
 LOGGED_OUT = re.compile(r"/logout|/SLO\b|SAML2/Redirect/SLO", re.I)
 DUO_TITLE = "AIM login needs Duo approval"
 DOWNLOAD_TIMEOUT_S = 600  # ~12 MB per exam, up to 10 per ZIP
+UPLOAD_TIMEOUT_MS = 300_000  # up to 30 MB per file
 
 
 class AimError(Exception):
     """A problem with the request or page (not an expired login, so no re-authentication)."""
+
+
+def is_change_request(url: str, body: bytes | None) -> bool:
+    """Would this request upload or delete an exam file? (Blocked in dry runs.)"""
+    return "plan=delete" in url.lower() or (body is not None and b"BtnUpload" in body)
+
+
+def _block_changes(route, request) -> None:
+    if is_change_request(request.url, request.post_data_buffer):
+        logger.debug("Dry run: blocked a request that would change AIM")
+        route.abort()
+    else:
+        route.continue_()
 
 
 @dataclass
@@ -124,15 +141,30 @@ class AimClient(LMSClient):
                 ferpa.click()
             logger.debug("Acknowledged the FERPA notice")
 
+    @property
+    def exams_url(self) -> str:
+        return self.base_url + "instructor/Testing.aspx?Step=Exams"
+
     def _open_completed(self, page) -> str:
         """Go to Testing > Completed with all rows on one page; return its HTML."""
-        page.goto(self.completed_url)
+        return self._open_grid(
+            page, self.completed_url, portal.PAGE_SIZE_ID, portal.parse_completed_table, "Completed exams"
+        )
+
+    def _open_exams(self, page) -> str:
+        """Go to Testing > Upcoming Exams with all rows on one page; return its HTML."""
+        return self._open_grid(
+            page, self.exams_url, portal.EXAMS_PAGE_SIZE_ID, portal.parse_upcoming_table, "Upcoming exams"
+        )
+
+    def _open_grid(self, page, url: str, page_size_id: str, parse: Callable[[str], list], what: str) -> str:
+        page.goto(url)
         page.wait_for_load_state("domcontentloaded")
         if "Testing.aspx" not in page.url:
-            raise RuntimeError(f"AIM did not open the Completed exams page (at {page.url})")
+            raise RuntimeError(f"AIM did not open the {what} page (at {page.url})")
         html = page.content()
         total = portal.parse_record_count(html)
-        select = page.locator(f"#{portal.PAGE_SIZE_ID}")
+        select = page.locator(f"#{page_size_id}")
         if total and select.count():
             options = [int(v) for v in select.locator("option").evaluate_all("os => os.map(o => o.value)")]
             current = int(select.input_value())
@@ -143,9 +175,9 @@ class AimClient(LMSClient):
                 page.wait_for_load_state("domcontentloaded")
                 html = page.content()
                 logger.debug(f"Showing {size} rows per page for {total} records")
-        rows = portal.parse_completed_table(html)
+        rows = parse(html)
         if total and len(rows) < total:
-            raise AimError(f"Only {len(rows)} of {total} completed exams are on one page")
+            raise AimError(f"Only {len(rows)} of {total} {what.lower()} are on one page")
         return html
 
     def _run_with_reauth(self, operation: Callable[[], T], headless: bool) -> T:
@@ -193,15 +225,25 @@ class AimClient(LMSClient):
         username: str | None,
         password: str | None,
         term: str | None,
+        open_page: Callable[..., str] | None = None,
+        read_only: bool = False,
     ) -> T:
+        """Sign in, open a Testing page (default Completed), check the term, run ``work(page, html)``.
+
+        ``read_only`` blocks every request that would upload or delete an exam file.
+        """
+        open_page = open_page or self._open_completed
+
         def _do() -> T:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=headless)
                 context = self._new_context(browser)
+                if read_only:
+                    context.route("**/*", _block_changes)
                 page = context.new_page()
                 try:
                     self._enter_portal(page, username, password, interactive=False)
-                    html = self._open_completed(page)
+                    html = open_page(page)
                     shown = portal.parse_term(html)
                     if term and shown and shown.casefold() != term.casefold():
                         raise AimError(f"AIM shows term {shown!r}, not {term!r}")
@@ -304,3 +346,104 @@ class AimClient(LMSClient):
         logger.info(f"Downloaded {len(rows)} exam(s) as {zip_path.name}: {[f.name for f in files]}")
         page.remove_listener("download", on_download)
         return DownloadBatch(rows=rows, zip_path=zip_path, files=files)
+
+    # ------------------------------------------------------------------ uploads
+
+    def upload_exams(
+        self,
+        config: UploadConfig,
+        netids: set[str] | None = None,
+        dry_run: bool = False,
+        headless: bool = True,
+        username: str | None = None,
+        password: str | None = None,
+        term: str | None = None,
+        on_action: Callable[[Action], None] | None = None,
+    ) -> list[Action]:
+        """Upload each student's personalized exam to their Upcoming Exams session.
+
+        See :mod:`edubag.aim.upload` for what is uploaded, replaced or skipped. Each upload is
+        checked on the page afterwards and then recorded in ``config.ledger``. ``dry_run`` only
+        plans (and blocks any request that would change AIM). ``on_action`` is called as each
+        student's upload, replacement or cleanup finishes.
+        """
+        ledger = Ledger(config.ledger) if config.ledger and not dry_run else None
+        finished: dict[str, Action] = {}  # survives a re-login retry: never upload twice
+
+        def work(page, html):
+            actions = upload.plan(config, portal.parse_upcoming_table(html), netids)
+            if dry_run:
+                return actions
+            out = []
+            for a in actions:
+                if a.netid in finished:
+                    out.append(finished[a.netid])
+                    continue
+                if a.kind not in upload.ACTS:
+                    out.append(a)
+                    continue
+                if a.kind in (upload.UPLOAD, upload.REPLACE):
+                    pdf = upload.check_pdf(a.student.pdf)
+                    self._upload_file(page, config, a)
+                    if ledger is not None and a.row is not None:
+                        ledger.record(
+                            config.module,
+                            a.netid,
+                            tag=config.tag,
+                            sha256=portal._sha256(pdf),
+                            session=a.row.key,
+                            replaced=[t for t in a.stale_tags if t],
+                        )
+                if a.stale:
+                    self._delete_files(page, a)
+                finished[a.netid] = a
+                out.append(a)
+                if on_action:
+                    on_action(a)
+            return out
+
+        return self._session(work, headless, username, password, term, open_page=self._open_exams, read_only=dry_run)
+
+    def _session_row(self, page, key: str) -> tuple[str, UpcomingRow]:
+        html = self._open_exams(page)  # fresh page: the upload button is click-once
+        row = next((r for r in portal.parse_upcoming_table(html) if r.key == key), None)
+        if row is None:
+            raise AimError("The exam session disappeared from Upcoming Exams")
+        return html, row
+
+    def _dialog_text(self, page) -> str:
+        dialog = page.locator(".ui-dialog:visible")
+        return " ".join(dialog.first.inner_text().split()) if dialog.count() else ""
+
+    def _upload_file(self, page, config: UploadConfig, a: Action) -> None:
+        assert a.row is not None
+        _, row = self._session_row(page, a.row.key)
+        page.locator(f"#{row.checkbox_id}").check()
+        page.locator(f"#{portal.UPLOAD_TITLE_ID}").fill(config.title_for(a.student))
+        page.locator(f"#{portal.UPLOAD_FILE_ID}").set_input_files(str(a.student.pdf))
+        try:
+            with page.expect_navigation(timeout=UPLOAD_TIMEOUT_MS):
+                page.locator(f"#{portal.UPLOAD_BUTTON_ID}").click()
+        except PlaywrightTimeoutError as e:
+            message = self._dialog_text(page)
+            raise AimError(f"{a.netid}: AIM did not finish the upload {message!r}".rstrip()) from e
+        page.wait_for_load_state("domcontentloaded")
+        message = self._dialog_text(page)
+        _, after = self._session_row(page, a.row.key)
+        if not any(config.file_tag(f) == config.tag for f in after.files):
+            raise AimError(f"{a.netid}: the uploaded file is not on the session" + (f" ({message})" if message else ""))
+        logger.info(f"{a.netid}: uploaded {a.student.pdf.name}")
+
+    def _delete_files(self, page, a: Action) -> None:
+        assert a.row is not None
+        hrefs = {f.delete_href for f in a.stale if f.delete_href}
+        if len(hrefs) < len(a.stale):
+            raise AimError(f"{a.netid}: an older file has no Delete link")
+        for href in sorted(hrefs):
+            page.goto(urljoin(self.base_url + "instructor/", href))
+            page.wait_for_load_state("domcontentloaded")
+        _, after = self._session_row(page, a.row.key)
+        left = [f for f in after.files if f.delete_href in hrefs]
+        if left:
+            raise AimError(f"{a.netid}: {len(left)} older file(s) were not deleted")
+        logger.info(f"{a.netid}: deleted {len(hrefs)} older file(s)")
