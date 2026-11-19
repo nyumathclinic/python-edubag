@@ -49,12 +49,17 @@ def report_export_url(
     report_type_id: str,
     excel: bool = True,
     all_attempts: bool = False,
+    gsf: bool = False,
 ) -> str:
     """URL that queues a report export, with the View Report page's defaults.
 
     Mirrors ``ExportToCsv`` on the View Report page: whole course, no
     completion date range, exempted users included. ``calcType`` 4 is
     "First Attempts" (the page default) and 3 is "All Attempts".
+
+    With ``gsf`` (the page's ``gsfFlag`` is True), mirrors ``ExportToCsvByGSF``
+    instead, which filters by groups and sections (empty lists: everyone).
+    Brightspace rejects the plain query with a 400 when the flag is on.
     """
     query = {
         "ou": course,
@@ -75,6 +80,10 @@ def report_export_url(
         "calcType": 3 if all_attempts else 4,
         "d2l_body_type": 3,
     }
+    if gsf:
+        for key in ("groupid", "grouptypeid"):
+            del query[key]
+        query.update({"viewby": 10, "gsfGroups": "[]", "gsfSections": "[]"})
     return f"{base_url}{REPORTS_PATH}quiz_report_export.d2l?{urlencode(query)}"
 
 
@@ -134,6 +143,12 @@ def parse_report_type_id(html: str) -> str | None:
     """The numeric report type (``rt``) from a "View Report" page."""
     field = BeautifulSoup(html, "html.parser").find("input", attrs={"name": "rt"})
     return field.get("value") if field else None
+
+
+def parse_gsf_flag(html: str) -> bool:
+    """Whether a "View Report" page exports by groups and sections (``gsfFlag``)."""
+    field = BeautifulSoup(html, "html.parser").find("input", attrs={"name": "gsfFlag"})
+    return bool(field) and field.get("value", "").casefold() == "true"
 
 
 def parse_export_alerts(text: str) -> list[dict]:

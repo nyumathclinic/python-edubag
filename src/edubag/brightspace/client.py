@@ -1036,14 +1036,16 @@ class BrightspaceClient(LMSClient):
         follows the notification to the file (see ``quizzes``).
         """
         build = page.request.get(quizzes.report_build_url(self.base_url, course, quiz["id"], report["id"]))
-        report_type_id = quizzes.parse_report_type_id(build.text())
+        build_html = build.text()
+        report_type_id = quizzes.parse_report_type_id(build_html)
         if report_type_id is None:
             raise PlaywrightError(f"No report type on the View Report page for {report['name']}")
 
         # Notifications already in the feed belong to earlier exports.
         seen = self._export_alert_ids(page, course)
         export_url = quizzes.report_export_url(
-            self.base_url, course, quiz["id"], report["id"], report_type_id, excel, all_attempts
+            self.base_url, course, quiz["id"], report["id"], report_type_id, excel, all_attempts,
+            gsf=quizzes.parse_gsf_flag(build_html),
         )
         response = page.request.get(export_url)
         if not response.ok:

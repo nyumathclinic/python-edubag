@@ -108,3 +108,17 @@ def test_report_matches_name_or_type():
     assert quizzes.report_matches(report, ["question details"])
     assert quizzes.report_matches(report, ["Question Details including text responses"])
     assert not quizzes.report_matches(report, ["User Attempts"])
+
+
+def test_report_export_url_by_groups_and_sections():
+    url = quizzes.report_export_url(BASE, "611388", "519740", "10149", "1", gsf=True)
+    query = parse_qs(urlparse(url).query, keep_blank_values=True)
+    assert query["viewby"] == ["10"]
+    assert query["gsfGroups"] == ["[]"] and query["gsfSections"] == ["[]"]
+    assert "groupid" not in query and "grouptypeid" not in query
+
+
+def test_parse_gsf_flag():
+    assert quizzes.parse_gsf_flag('<input type="hidden" name="gsfFlag" value="True" />')
+    assert not quizzes.parse_gsf_flag('<input type="hidden" name="gsfFlag" value="False" />')
+    assert not quizzes.parse_gsf_flag("<form></form>")
