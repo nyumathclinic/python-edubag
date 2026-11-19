@@ -1,13 +1,16 @@
 """Module to automate interactions with the Poll Everywhere platform."""
 
 import asyncio
+import json
+import os
 import re
 import threading
-from collections.abc import Callable
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import platformdirs
 from loguru import logger
@@ -21,6 +24,13 @@ T = TypeVar("T")
 
 _ASSIGNMENT_ROW_ID_RE = re.compile(r"lms_lti_advantage_assignment_(\d+)")
 _CLASS_ROW_ID_RE = re.compile(r"lms_lti_advantage_user_connection_(\d+)")
+
+# Report filter values for which "runs" of a poll to include. A run ends each time the
+# presenter uses "Clear responses" (the cleared responses are archived, not deleted).
+_RUNS_ARCHIVE_GROUP_ID = {"all": -1, "current": 0}
+_REPORT_POLL_INTERVAL = 3.0  # seconds, as the Poll Everywhere web app does
+# Folder items that are not single activities (and so get no per-poll report)
+_NON_POLL_TYPES = frozenset({"survey", "competition", "group"})
 
 
 def _run_sync_in_thread(func: Callable[..., T], *args, **kwargs) -> T:
@@ -116,12 +126,310 @@ class Assignment:
     class_id: int | None = None
 
 
+@dataclass
+class Folder:
+    """A folder ("group") of activities in Poll Everywhere's Activities page.
+
+    Attributes:
+        id: Poll Everywhere identifier for the folder.
+        name: Name of the folder.
+        parent_id: Identifier of the enclosing folder, or None at the top level.
+        path: Folder names from the top level down, joined with ``/``.
+    """
+
+    id: int
+    name: str
+    parent_id: int | None = None
+    path: str = ""
+
+
+@dataclass(frozen=True)
+class Poll:
+    """A Poll Everywhere activity (multiple choice, open-ended, word cloud, ...).
+
+    Frozen (and so hashable), so polls can key a `Client.download_responses` map.
+
+    Attributes:
+        id: Poll Everywhere identifier for the activity.
+        type: Activity type, e.g. ``multiple_choice_poll``, ``free_text_poll``, ``discourse``.
+        title: The activity's title (its question).
+        group_id: Identifier of the `Folder` the activity is in, or None if not in a folder.
+        permalink: The activity's permalink.
+        results_count: Number of responses (in the current run).
+        created_at: When the activity was created.
+        updated_at: When the activity was last edited.
+        state: ``opened`` or ``closed``.
+        owner_id: Identifier of the presenter who owns the activity.
+    """
+
+    id: int
+    type: str
+    title: str
+    group_id: int | None = None
+    permalink: str = ""
+    results_count: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    state: str = ""
+    owner_id: int | None = None
+
+
+def _parse_iso(text: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp from the JSON API, or return None."""
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        logger.debug(f"Could not parse Poll Everywhere timestamp: {text!r}")
+        return None
+
+
+def _poll_from_api(item: Mapping[str, Any]) -> Poll:
+    """Build a `Poll` from a JSON API activity.
+
+    ``/api/activities`` returns flat objects; ``/api/polls`` wraps each one in
+    a single-key object naming its type (``{"multiple_choice_poll": {...}}``).
+    Both are accepted.
+    """
+    data = item
+    if len(item) == 1:
+        ((kind, inner),) = item.items()
+        if isinstance(inner, Mapping):
+            data = {"type": kind, **inner}
+    group_id = data.get("group_id")
+    if group_id is None and isinstance(data.get("group"), Mapping):
+        group_id = data["group"].get("id")
+    return Poll(
+        id=int(data["id"]),
+        type=data.get("type") or "",
+        title=(data.get("title") or "").strip(),
+        group_id=int(group_id) if group_id else None,
+        permalink=data.get("permalink") or "",
+        results_count=int(data.get("results_count") or 0),
+        created_at=_parse_iso(data.get("created_at")),
+        updated_at=_parse_iso(data.get("updated_at")),
+        state=data.get("state") or "",
+        owner_id=data.get("owner_id"),
+    )
+
+
+def _flatten_folders(
+    groups: Iterable[Mapping[str, Any]], parent: Folder | None = None
+) -> list[Folder]:
+    """Flatten the ``/api/groups`` folder tree, depth first, into a list of `Folder`s."""
+    folders: list[Folder] = []
+    for group in groups:
+        name = (group.get("name") or "").strip()
+        folder = Folder(
+            id=int(group["id"]),
+            name=name,
+            parent_id=parent.id if parent else None,
+            path=f"{parent.path}/{name}" if parent else name,
+        )
+        folders.append(folder)
+        folders.extend(_flatten_folders(group.get("children") or [], folder))
+    return folders
+
+
+def _folder_subtree(folders: Iterable[Folder], root_id: int) -> list[int]:
+    """Identifiers of the folder `root_id` and every folder nested inside it."""
+    children: dict[int | None, list[int]] = {}
+    for folder in folders:
+        children.setdefault(folder.parent_id, []).append(folder.id)
+    ids, stack = [], [root_id]
+    while stack:
+        folder_id = stack.pop()
+        ids.append(folder_id)
+        stack.extend(reversed(children.get(folder_id, [])))
+    return ids
+
+
+def _resolve_folder(folders: list[Folder], spec: int | str) -> Folder:
+    """Find a folder by id, name, or ``/``-separated path.
+
+    Raises:
+        ValueError: If no folder, or more than one folder, matches.
+    """
+    text = str(spec).strip()
+    if text.isdigit():
+        matches = [f for f in folders if f.id == int(text)]
+    else:
+        matches = [f for f in folders if f.path == text.strip("/")]
+        if not matches:
+            matches = [f for f in folders if f.name.casefold() == text.casefold()]
+    if not matches:
+        raise ValueError(f"No Poll Everywhere folder matches {spec!r}.")
+    if len(matches) > 1:
+        paths = ", ".join(f"{f.path} ({f.id})" for f in matches)
+        raise ValueError(f"Folder {spec!r} is ambiguous: {paths}. Use its path or id.")
+    return matches[0]
+
+
+class _JsonApi:
+    """Thin wrapper around a Playwright ``APIRequestContext`` for Poll Everywhere's JSON API.
+
+    The session cookies come from the stored auth state; mutating requests carry
+    the CSRF token from ``/api/csrf_token``, as the web app's own requests do.
+    """
+
+    def __init__(self, request):
+        self._request = request
+        self._csrf: str | None = None
+
+    @staticmethod
+    def _check(response, path: str) -> None:
+        if response.status in (401, 403) or re.search(r"/(login|sign_in)\b", response.url or ""):
+            raise RuntimeError("Authentication session expired. Please re-authenticate.")
+        if not response.ok:
+            raise RuntimeError(
+                f"Poll Everywhere {path} failed: HTTP {response.status} {response.text()[:200]}"
+            )
+
+    def _headers(self) -> dict[str, str]:
+        if self._csrf is None:
+            self._csrf = self.get("/api/csrf_token")["token"]
+        return {"X-CSRF-Token": self._csrf, "Content-Type": "application/json"}
+
+    def get(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
+        response = self._request.get(path, params=params)
+        self._check(response, path)
+        return response.json()
+
+    def get_bytes(self, path: str) -> bytes:
+        response = self._request.get(path)
+        self._check(response, path)
+        return response.body()
+
+    def post(self, path: str, payload: Mapping[str, Any]) -> Any:
+        response = self._request.post(path, headers=self._headers(), data=json.dumps(payload))
+        self._check(response, path)
+        return response.json()
+
+    def delete(self, path: str) -> None:
+        response = self._request.delete(path, headers=self._headers())
+        if response.status != 404:  # already gone is fine
+            self._check(response, path)
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write bytes so an interrupted run never leaves a truncated file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+@dataclass
+class _ReportJob:
+    poll: Poll | int
+    dest: Path
+    report_id: int | None = None
+    error: Exception | None = None
+    done: bool = False
+    deadline: float = field(default=0.0)
+
+    @property
+    def poll_id(self) -> int:
+        return self.poll.id if isinstance(self.poll, Poll) else int(self.poll)
+
+
+def _download_reports(
+    api: _JsonApi,
+    jobs: list[_ReportJob],
+    *,
+    runs: str = "all",
+    report_type: str = "participant",
+    keep_reports: bool = False,
+    timeout: float = 300.0,
+    batch_size: int = 10,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Run one Poll Everywhere report per job and save each one's CSV to ``job.dest``.
+
+    Reports are created ``batch_size`` at a time, so their (server-side,
+    queued) generation overlaps. Each report is deleted once its CSV is saved
+    or it fails, unless ``keep_reports``. Errors are recorded on the job
+    (``job.error``) rather than raised, except an expired session, which
+    aborts everything.
+    """
+    try:
+        archive_group_id = _RUNS_ARCHIVE_GROUP_ID[runs]
+    except KeyError:
+        raise ValueError(f"runs must be one of {sorted(_RUNS_ARCHIVE_GROUP_ID)}, not {runs!r}") from None
+
+    def cleanup(job: _ReportJob) -> None:
+        if job.report_id is not None and not keep_reports:
+            try:
+                api.delete(f"/api/reports/{job.report_id}")
+            except Exception as e:  # leaving a stray report behind is not fatal
+                logger.warning(f"Could not delete Poll Everywhere report {job.report_id}: {e}")
+
+    for start in range(0, len(jobs), batch_size):
+        batch = jobs[start : start + batch_size]
+        try:
+            for job in batch:
+                filters: dict[str, Any] = {"archive_group_id": archive_group_id}
+                if isinstance(job.poll, Poll) and job.poll.owner_id:
+                    filters["presenter_ids"] = [job.poll.owner_id]
+                try:
+                    report = api.post(
+                        "/api/reports",
+                        {
+                            "polls": [job.poll_id],
+                            "surveys": [],
+                            "competitions": [],
+                            "groups": [],
+                            "name": f"edubag export {job.poll_id}",
+                            "report_type": report_type,
+                            "filters": filters,
+                        },
+                    )
+                    job.report_id = int(report["id"])
+                    job.deadline = clock() + timeout
+                except RuntimeError as e:
+                    if "Authentication" in str(e):
+                        raise
+                    job.error, job.done = e, True
+
+            pending = [job for job in batch if not job.done]
+            while pending:
+                sleep(_REPORT_POLL_INTERVAL)
+                for job in pending:
+                    try:
+                        report = api.get(f"/api/reports/{job.report_id}", params={"results": "true"})
+                        state = report.get("state")
+                        if state == "finished":
+                            _write_atomic(job.dest, api.get_bytes(f"/api/reports/{job.report_id}.csv"))
+                            job.done = True
+                        elif state == "failed":
+                            raise RuntimeError(f"report failed: {report.get('error')}")
+                        elif clock() > job.deadline:
+                            raise RuntimeError(f"report still {state!r} after {timeout:.0f}s")
+                    except RuntimeError as e:
+                        if "Authentication" in str(e):
+                            raise
+                        job.error, job.done = e, True
+                    except OSError as e:
+                        job.error, job.done = e, True
+                    if job.done:
+                        cleanup(job)
+                pending = [job for job in pending if not job.done]
+        finally:
+            for job in batch:
+                if not job.done:
+                    cleanup(job)
+
+
 class Client(LMSClient):
     """Client to interact with the Poll Everywhere platform.
 
     This client provides automated browser-based interactions with Poll
     Everywhere's LMS integration (Brightspace via LTI Advantage) for syncing
-    rosters and assignment grades.
+    rosters and assignment grades, and uses Poll Everywhere's JSON API (with
+    the same stored session) to list folders and activities and to download
+    participant responses.
 
     Note on headless parameter:
         Methods that accept `headless` parameter default to:
@@ -541,3 +849,121 @@ class Client(LMSClient):
             return synced
 
         return _run_sync_in_thread(_do_sync)
+
+    # ----- JSON API: folders, activities, and responses ---------------------
+
+    def _with_api(self, func: Callable[[_JsonApi], T]) -> T:
+        """Run ``func`` with a JSON API session built from the stored auth state."""
+        if not Path(self.auth_state_path).exists():
+            raise RuntimeError(
+                f"No Poll Everywhere auth state at {self.auth_state_path}. "
+                "Run `edubag polleverywhere authenticate` first."
+            )
+
+        def _do() -> T:
+            with sync_playwright() as p:
+                request = p.request.new_context(
+                    base_url=self.base_url,
+                    storage_state=str(self.auth_state_path),
+                    extra_http_headers={"Accept": "application/json"},
+                    timeout=120000,
+                )
+                try:
+                    return func(_JsonApi(request))
+                finally:
+                    request.dispose()
+
+        return _run_sync_in_thread(_do)
+
+    def list_folders(self) -> list[Folder]:
+        """List every activity folder, nested folders included, depth first."""
+        return self._with_api(lambda api: _flatten_folders(api.get("/api/groups")))
+
+    def resolve_folder(self, spec: int | str) -> Folder:
+        """Find a folder by id, name, or ``/``-separated path.
+
+        Raises:
+            ValueError: If no folder, or more than one, matches.
+        """
+        return _resolve_folder(self.list_folders(), spec)
+
+    def list_polls(self, folder: int | str, recursive: bool = True) -> list[Poll]:
+        """List the activities in a folder.
+
+        Args:
+            folder: The folder's id, name, or path.
+            recursive: Whether to include activities in nested folders.
+
+        Returns:
+            The `Poll`s, folder by folder (depth first), in their order within each folder.
+        """
+
+        def _do(api: _JsonApi) -> list[Poll]:
+            folders = _flatten_folders(api.get("/api/groups"))
+            root = _resolve_folder(folders, folder)
+            folder_ids = _folder_subtree(folders, root.id) if recursive else [root.id]
+            polls: list[Poll] = []
+            for folder_id in folder_ids:
+                items = api.get("/api/activities", params={"group_id": folder_id})
+                # Only polls: surveys and competitions aren't supported by per-poll reports.
+                polls.extend(
+                    poll
+                    for poll in map(_poll_from_api, items)
+                    if poll.group_id == folder_id and poll.type not in _NON_POLL_TYPES
+                )
+            return polls
+
+        return self._with_api(_do)
+
+    def download_responses(
+        self,
+        polls: Mapping[Poll | int, Path] | Iterable[tuple[Poll | int, Path]],
+        *,
+        runs: str = "all",
+        report_type: str = "participant",
+        keep_reports: bool = False,
+        timeout: float = 300.0,
+        batch_size: int = 10,
+    ) -> dict[int, Exception | None]:
+        """Save each poll's responses as a CSV, via a Poll Everywhere report.
+
+        For each poll this creates a report (by default a "participant" report:
+        one row per participant, with their response, the time it was received,
+        and how they responded), waits for Poll Everywhere to generate it,
+        downloads its CSV, and deletes the report again.
+
+        Args:
+            polls: Map (or pairs) from a `Poll` or poll id to the CSV path to write.
+                Passing `Poll`s (e.g. from `list_polls`) restricts each report to
+                the poll owner's runs, as the web app does.
+            runs: ``"all"`` to include responses from every run (including ones
+                archived with "Clear responses"), or ``"current"`` for only the current run.
+            report_type: Poll Everywhere report type, e.g. ``participant`` or ``gradebook``.
+            keep_reports: Keep the reports in Poll Everywhere instead of deleting them.
+            timeout: Seconds to wait for each report to be generated.
+            batch_size: How many reports to generate at once.
+
+        Returns:
+            Map from poll id to None (saved) or the error that prevented saving it.
+
+        Raises:
+            ValueError: If ``runs`` is not ``"all"`` or ``"current"``.
+            RuntimeError: If authentication expired.
+        """
+        items = polls.items() if isinstance(polls, Mapping) else polls
+        jobs = [_ReportJob(poll=poll, dest=Path(dest)) for poll, dest in items]
+        if runs not in _RUNS_ARCHIVE_GROUP_ID:
+            raise ValueError(f"runs must be one of {sorted(_RUNS_ARCHIVE_GROUP_ID)}, not {runs!r}")
+        if jobs:
+            self._with_api(
+                lambda api: _download_reports(
+                    api,
+                    jobs,
+                    runs=runs,
+                    report_type=report_type,
+                    keep_reports=keep_reports,
+                    timeout=timeout,
+                    batch_size=batch_size,
+                )
+            )
+        return {job.poll_id: job.error for job in jobs}
