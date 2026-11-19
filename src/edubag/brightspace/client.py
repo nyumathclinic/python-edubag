@@ -281,7 +281,7 @@ class BrightspaceClient(LMSClient):
                     raise RuntimeError("Authentication session expired.")
 
                 # Navigate to Grades
-                page.get_by_role("link", name="Grades").click()
+                page.get_by_role("link", name="Grades", exact=True).click()
 
                 enter_grades_url = re.compile(r".*grades/admin/enter/user_list_view\.d2l.*")
                 if not enter_grades_url.search(page.url):

@@ -13,6 +13,7 @@ from loguru import logger
 from playwright.sync_api import Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from edubag import nyu_sso
 from edubag.albert.details import normalize_label, parse_detail_field
 from edubag.albert.roster import (
     HTML_FIELD_ID,
@@ -42,6 +43,8 @@ class AlbertClient(LMSClient):
     """
 
     base_url = "https://sis.portal.nyu.edu/psp/ihprod/EMPLOYEE/EMPL/?cmd=start"
+    _ALBERT_LANDING = re.compile(r".*/h/\?tab=IS_FSA_TAB.*")
+    _DUO_TITLE = "Albert login needs Duo approval"
     course_base_url = (
         "https://sis.nyu.edu/psc/csprod/EMPLOYEE/SA/c/"
         "NYU_SR_FL.NYU_CLASSROSTER_FL.GBL"
@@ -179,61 +182,20 @@ class AlbertClient(LMSClient):
             headless = False
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
-            context = browser.new_context()
+            # Start from the saved state minus its session cookies (like a browser restart):
+            # the stale PeopleSoft session goes, but the persistent Microsoft "stay signed in"
+            # and Duo device-trust cookies stay, so SSO can usually finish without a Duo push.
+            state = None
+            if self.auth_state_path.exists():
+                try:
+                    state = nyu_sso.drop_session_cookies(json.loads(self.auth_state_path.read_text()))
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Ignoring unreadable auth state {self.auth_state_path}: {e}")
+            context = browser.new_context(**({"storage_state": state} if state else {}))
             page = context.new_page()
 
             page.goto(self.base_url)
-
-            # Wait for page to load and form to appear instead of URL (SAML can redirect)
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
-            # Wait for the username input field to appear and be visible
-            page.locator("input[type='email']").wait_for(state="visible", timeout=10000)
-
-            if username is not None:
-                page.locator("input[type='email']").fill(username)
-                page.get_by_role("button", name="Next").click()
-
-                if password is not None:
-                    # Wait for password field to appear
-                    page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    page.locator("input[type='password']").wait_for(state="visible", timeout=10000)
-                    page.locator("input[type='password']").fill(password)
-                    page.get_by_role("button", name="Sign in").click()
-                    page.get_by_role("button", name="Approve with MFA (Duo)‎ You").click()
-                else:
-                    print("Please enter your password in the browser window and complete MFA.")
-            else:
-                print("Please enter your username and password in the browser window, then complete MFA.")
-
-            # Microsoft SSO occasionally inserts a "Stay signed in?" interstitial.
-            # If present, check "Don't show this again" and continue.
-            kmsi_heading = page.locator("div[role='heading']", has_text="Stay signed in?")
-            kmsi_checkbox = page.locator("#KmsiCheckboxField")
-            kmsi_submit = page.locator("#idSIButton9")
-            kmsi_seen = False
-
-            try:
-                kmsi_heading.wait_for(state="visible", timeout=15000)
-                kmsi_seen = True
-            except PlaywrightTimeoutError:
-                try:
-                    kmsi_checkbox.wait_for(state="visible", timeout=15000)
-                    kmsi_seen = True
-                except PlaywrightTimeoutError:
-                    kmsi_seen = False
-
-            if kmsi_seen:
-                if kmsi_checkbox.count() > 0 and kmsi_checkbox.is_visible() and not kmsi_checkbox.is_checked():
-                    kmsi_checkbox.check()
-                kmsi_submit.click()
-                logger.debug("Handled 'Stay signed in?' interstitial during Albert authentication")
-
-            # SAML and MFA redirects can be slow; wait for the Albert landing URL pattern.
-            page.wait_for_url(
-                re.compile(r".*/h/\?tab=IS_FSA_TAB.*"),
-                timeout=120000,
-                wait_until="domcontentloaded",
-            )
+            nyu_sso.sso_login(page, self._ALBERT_LANDING, username, password, title=self._DUO_TITLE)
 
             context.storage_state(path=self.auth_state_path)
             logger.debug(f"Authentication state saved at {self.auth_state_path}")
@@ -598,8 +560,6 @@ class AlbertClient(LMSClient):
             except (TimeoutError, PlaywrightTimeoutError, RuntimeError):
                 if attempt == 1:
                     raise
-                if self.auth_state_path.exists():
-                    self.auth_state_path.unlink()
                 self.authenticate(username=username, password=password, headless=headless)
         raise RuntimeError("Unable to fetch roster")
 
@@ -653,8 +613,6 @@ class AlbertClient(LMSClient):
             except (TimeoutError, PlaywrightTimeoutError, RuntimeError):
                 if attempt == 1:
                     raise
-                if self.auth_state_path.exists():
-                    self.auth_state_path.unlink()
                 self.authenticate(username=username, password=password, headless=headless)
         raise RuntimeError("Unable to fetch course details")
 
@@ -753,8 +711,6 @@ class AlbertClient(LMSClient):
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")
                     logger.info("Re-authenticating...")
-                    if self.auth_state_path.exists():
-                        self.auth_state_path.unlink()
                     self.authenticate(username=username, password=password, headless=headless)
                 else:
                     logger.error(f"Max retries exceeded. {type(e).__name__}: {e}")
@@ -860,8 +816,6 @@ class AlbertClient(LMSClient):
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")
                     logger.info("Re-authenticating...")
-                    if self.auth_state_path.exists():
-                        self.auth_state_path.unlink()
                     self.authenticate(username=username, password=password, headless=headless)
                 else:
                     logger.error(f"Max retries exceeded. {type(e).__name__}: {e}")
@@ -1065,8 +1019,6 @@ class AlbertClient(LMSClient):
                 if attempt < max_retries:
                     logger.warning(f"{type(e).__name__}: {e} Authentication may have expired.")
                     logger.info("Re-authenticating...")
-                    if self.auth_state_path.exists():
-                        self.auth_state_path.unlink()
                     self.authenticate(username=username, password=password, headless=headless)
                 else:
                     logger.error(f"Max retries exceeded. {type(e).__name__}: {e}")
